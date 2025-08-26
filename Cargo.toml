@@ -6,4 +6,8 @@ edition = "2024"
 [dependencies]
 arrow = "56.1.0"
 datafusion = "49.0.2"
+datafusion-common = "49.0.2"
+datafusion-expr = "49.0.2"
+datafusion-postgres = "0.8.1"
 parquet = "56.1.0"
+tokio = {version = "1.47.1", features = ["full"] }
