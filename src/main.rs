@@ -30,12 +30,18 @@ async fn main() -> Result<(), std::io::Error> {
         .build_arc()
         .unwrap();
 
+    // Create the catalog system and load existing tables
+    let catalog_list = Arc::new(JsonFusionCatalogProviderList::new(json_base_dir));
+    if let Err(e) = catalog_list.load_existing_tables().await {
+        eprintln!("Warning: Failed to load some existing tables: {}", e);
+    }
+
     // Create a SessionState using the config and runtime_env
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime_env)
         .with_type_planner(Arc::new(type_planner::JsonTypePlanner))
-        .with_catalog_list(Arc::new(JsonFusionCatalogProviderList::new(json_base_dir)))
+        .with_catalog_list(catalog_list)
         // include support for built in functions and configurations
         .with_default_features()
         .build();

@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
+use arrow_schema::SchemaRef as ArrowSchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider, Session};
-use datafusion::common::{DFSchema, DFSchemaRef};
+use datafusion::common::DFSchemaRef;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -28,9 +28,28 @@ pub struct JsonTableProvider {
 }
 
 impl JsonTableProvider {
-    pub async fn new(base_dir: PathBuf, given_schema: ArrowSchemaRef) -> Result<Self> {
+    pub async fn create(base_dir: PathBuf, given_schema: ArrowSchemaRef) -> Result<Self> {
         let manifest = Manifest::create_or_load(base_dir.clone()).await?;
-        // let full_schema = manifest.expanded_schema();
+        // todo: load full schema from manifest
+        let full_schema = given_schema.clone();
+
+        let given_schema_json = serde_json::to_string(&given_schema)?;
+        tokio::fs::write(base_dir.join("given_schema.json"), given_schema_json).await?;
+
+        Ok(Self {
+            base_dir,
+            manifest,
+            given_schema,
+            full_schema,
+        })
+    }
+
+    pub async fn open(base_dir: PathBuf) -> Result<Self> {
+        let given_schema_json =
+            tokio::fs::read_to_string(base_dir.join("given_schema.json")).await?;
+        let given_schema: ArrowSchemaRef = serde_json::from_str(&given_schema_json)?;
+
+        let manifest = Manifest::create_or_load(base_dir.clone()).await?;
         let full_schema = given_schema.clone();
 
         Ok(Self {
@@ -95,6 +114,62 @@ impl JsonFusionSchemaProvider {
             tables: RwLock::new(HashMap::new()),
         }
     }
+
+    pub async fn load_existing_tables(&self) -> Result<()> {
+        // Scan the base directory for existing table directories
+        let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("Warning: Could not read base directory {:?}: {}", self.base_dir, e);
+                return Ok(());
+            }
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let entry_path = entry.path();
+            
+            // Skip if not a directory
+            if !entry_path.is_dir() {
+                continue;
+            }
+
+            // Get table name from directory name
+            let table_name = match entry_path.file_name() {
+                Some(name) => match name.to_str() {
+                    Some(name_str) => name_str.to_string(),
+                    None => {
+                        eprintln!("Warning: Invalid directory name in {:?}", entry_path);
+                        continue;
+                    }
+                },
+                None => continue,
+            };
+
+            // Check if this directory contains a given_schema.json file
+            let schema_file = entry_path.join("given_schema.json");
+            if !schema_file.exists() {
+                // Not a table directory, skip silently
+                continue;
+            }
+
+            // Try to load the table
+            match JsonTableProvider::open(entry_path.clone()).await {
+                Ok(table_provider) => {
+                    // Successfully loaded table, register it
+                    let table_arc = Arc::new(table_provider);
+                    let mut tables = self.tables.write().unwrap();
+                    tables.insert(table_name.clone(), table_arc);
+                    println!("Loaded existing table: {}", table_name);
+                },
+                Err(e) => {
+                    eprintln!("Warning: Failed to load table from {:?}: {}", entry_path, e);
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -124,7 +199,10 @@ impl SchemaProvider for JsonFusionSchemaProvider {
         let handle = tokio::runtime::Handle::current();
         let json_table = std::thread::spawn(move || {
             handle
-                .block_on(JsonTableProvider::new(table_dir, incoming_table.schema()))
+                .block_on(JsonTableProvider::create(
+                    table_dir,
+                    incoming_table.schema(),
+                ))
                 .unwrap()
         })
         .join()
@@ -168,6 +246,20 @@ impl JsonFusionCatalogProvider {
             base_dir,
             schemas: RwLock::new(schemas),
         }
+    }
+
+    pub async fn load_existing_tables(&self) -> Result<()> {
+        // Get the public schema and load existing tables
+        let schemas = self.schemas.read().unwrap();
+        if let Some(public_schema) = schemas.get("public") {
+            // Downcast to JsonFusionSchemaProvider to call load_existing_tables
+            if let Some(json_schema) = public_schema.as_any().downcast_ref::<JsonFusionSchemaProvider>() {
+                json_schema.load_existing_tables().await?;
+            } else {
+                eprintln!("Warning: Public schema is not a JsonFusionSchemaProvider");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -226,6 +318,20 @@ impl JsonFusionCatalogProviderList {
             base_dir,
             catalogs: RwLock::new(catalogs),
         }
+    }
+
+    pub async fn load_existing_tables(&self) -> Result<()> {
+        // Get the jsonfusion catalog and load existing tables
+        let catalogs = self.catalogs.read().unwrap();
+        if let Some(jsonfusion_catalog) = catalogs.get("jsonfusion") {
+            // Downcast to JsonFusionCatalogProvider to call load_existing_tables
+            if let Some(json_catalog) = jsonfusion_catalog.as_any().downcast_ref::<JsonFusionCatalogProvider>() {
+                json_catalog.load_existing_tables().await?;
+            } else {
+                eprintln!("Warning: jsonfusion catalog is not a JsonFusionCatalogProvider");
+            }
+        }
+        Ok(())
     }
 }
 
