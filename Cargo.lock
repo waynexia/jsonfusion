@@ -88,6 +88,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.99"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,6 +486,9 @@ name = "arrow-schema"
 version = "56.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa93af9ff2bb80de539e6eb2c1c8764abd0f4b73ffb0d7c82bf1f9868785e66"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "arrow-select"
@@ -2164,13 +2173,18 @@ dependencies = [
 name = "jsonfusion"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arrow 56.1.0",
+ "arrow-schema 56.1.0",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
  "datafusion-postgres",
  "parquet 56.1.0",
+ "serde",
+ "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3641,6 +3655,7 @@ checksum = "f33196643e165781c20a5ead5582283a7dacbb87855d867fbc2df3f81eddc1be"
 dependencies = [
  "getrandom 0.3.3",
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 

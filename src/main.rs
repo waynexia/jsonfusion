@@ -1,3 +1,6 @@
+mod manifest;
+mod schema;
+mod table_provider;
 mod type_planner;
 
 use std::sync::Arc;
