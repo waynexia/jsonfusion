@@ -4,7 +4,7 @@ mod table_provider;
 mod type_planner;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -17,6 +17,9 @@ use crate::table_provider::JsonFusionCatalogProviderList;
 async fn main() -> Result<(), std::io::Error> {
     // Define hardcoded base directory for JSON files
     let json_base_dir = PathBuf::from("./jsonfusion");
+
+    // Create shared state for JSONFUSION columns
+    let jsonfusion_columns: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
 
     // Configure a 4k batch size
     let config = SessionConfig::new()
@@ -31,7 +34,10 @@ async fn main() -> Result<(), std::io::Error> {
         .unwrap();
 
     // Create the catalog system and load existing tables
-    let catalog_list = Arc::new(JsonFusionCatalogProviderList::new(json_base_dir));
+    let catalog_list = Arc::new(JsonFusionCatalogProviderList::new(
+        json_base_dir,
+        jsonfusion_columns.clone(),
+    ));
     if let Err(e) = catalog_list.load_existing_tables().await {
         eprintln!("Warning: Failed to load some existing tables: {}", e);
     }
@@ -40,7 +46,9 @@ async fn main() -> Result<(), std::io::Error> {
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime_env)
-        .with_type_planner(Arc::new(type_planner::JsonTypePlanner))
+        .with_type_planner(Arc::new(type_planner::JsonTypePlanner::new(
+            jsonfusion_columns.clone(),
+        )))
         .with_catalog_list(catalog_list)
         // include support for built in functions and configurations
         .with_default_features()

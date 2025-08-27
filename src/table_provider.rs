@@ -4,10 +4,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use arrow_schema::{Field, Schema, SchemaRef as ArrowSchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider, Session};
-use datafusion::common::DFSchemaRef;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -105,13 +104,15 @@ impl TableProvider for JsonTableProvider {
 pub struct JsonFusionSchemaProvider {
     base_dir: PathBuf,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
+    jsonfusion_columns: Arc<RwLock<Vec<String>>>,
 }
 
 impl JsonFusionSchemaProvider {
-    pub fn new(base_dir: PathBuf) -> Self {
+    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<Vec<String>>>) -> Self {
         Self {
             base_dir,
             tables: RwLock::new(HashMap::new()),
+            jsonfusion_columns,
         }
     }
 
@@ -120,14 +121,17 @@ impl JsonFusionSchemaProvider {
         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!("Warning: Could not read base directory {:?}: {}", self.base_dir, e);
+                eprintln!(
+                    "Warning: Could not read base directory {:?}: {}",
+                    self.base_dir, e
+                );
                 return Ok(());
             }
         };
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let entry_path = entry.path();
-            
+
             // Skip if not a directory
             if !entry_path.is_dir() {
                 continue;
@@ -160,7 +164,7 @@ impl JsonFusionSchemaProvider {
                     let mut tables = self.tables.write().unwrap();
                     tables.insert(table_name.clone(), table_arc);
                     println!("Loaded existing table: {}", table_name);
-                },
+                }
                 Err(e) => {
                     eprintln!("Warning: Failed to load table from {:?}: {}", entry_path, e);
                     continue;
@@ -193,16 +197,41 @@ impl SchemaProvider for JsonFusionSchemaProvider {
         name: String,
         incoming_table: Arc<dyn TableProvider>,
     ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        // Get and clear the JSONFUSION columns from shared state
+        let jsonfusion_column_names = if let Ok(mut columns) = self.jsonfusion_columns.write() {
+            let names = std::mem::take(&mut *columns);
+            names
+        } else {
+            Vec::new()
+        };
+
+        // Create a modified schema with JSONFUSION metadata
+        let original_schema = incoming_table.schema();
+        let fields_with_metadata: Vec<Field> = original_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if jsonfusion_column_names.contains(field.name()) {
+                    // Add JSONFUSION metadata to this field
+                    let mut metadata = field.metadata().clone();
+                    metadata.insert("JSONFUSION".to_string(), "true".to_string());
+                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                        .with_metadata(metadata)
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect();
+
+        let schema_with_metadata = Arc::new(Schema::new(fields_with_metadata));
+
         // Instead of using the incoming table, create a JsonTableProvider
         let table_dir = self.base_dir.join(&name);
 
         let handle = tokio::runtime::Handle::current();
         let json_table = std::thread::spawn(move || {
             handle
-                .block_on(JsonTableProvider::create(
-                    table_dir,
-                    incoming_table.schema(),
-                ))
+                .block_on(JsonTableProvider::create(table_dir, schema_with_metadata))
                 .unwrap()
         })
         .join()
@@ -229,14 +258,18 @@ impl SchemaProvider for JsonFusionSchemaProvider {
 pub struct JsonFusionCatalogProvider {
     base_dir: PathBuf,
     schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
+    jsonfusion_columns: Arc<RwLock<Vec<String>>>,
 }
 
 impl JsonFusionCatalogProvider {
-    pub fn new(base_dir: PathBuf) -> Self {
+    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<Vec<String>>>) -> Self {
         let mut schemas = HashMap::new();
 
         // Auto-register the "public" schema
-        let public_schema = Arc::new(JsonFusionSchemaProvider::new(base_dir.clone()));
+        let public_schema = Arc::new(JsonFusionSchemaProvider::new(
+            base_dir.clone(),
+            jsonfusion_columns.clone(),
+        ));
         schemas.insert(
             "public".to_string(),
             public_schema as Arc<dyn SchemaProvider>,
@@ -245,6 +278,7 @@ impl JsonFusionCatalogProvider {
         Self {
             base_dir,
             schemas: RwLock::new(schemas),
+            jsonfusion_columns,
         }
     }
 
@@ -253,7 +287,10 @@ impl JsonFusionCatalogProvider {
         let schemas = self.schemas.read().unwrap();
         if let Some(public_schema) = schemas.get("public") {
             // Downcast to JsonFusionSchemaProvider to call load_existing_tables
-            if let Some(json_schema) = public_schema.as_any().downcast_ref::<JsonFusionSchemaProvider>() {
+            if let Some(json_schema) = public_schema
+                .as_any()
+                .downcast_ref::<JsonFusionSchemaProvider>()
+            {
                 json_schema.load_existing_tables().await?;
             } else {
                 eprintln!("Warning: Public schema is not a JsonFusionSchemaProvider");
@@ -301,14 +338,18 @@ impl CatalogProvider for JsonFusionCatalogProvider {
 pub struct JsonFusionCatalogProviderList {
     base_dir: PathBuf,
     catalogs: RwLock<HashMap<String, Arc<dyn CatalogProvider>>>,
+    jsonfusion_columns: Arc<RwLock<Vec<String>>>,
 }
 
 impl JsonFusionCatalogProviderList {
-    pub fn new(base_dir: PathBuf) -> Self {
+    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<Vec<String>>>) -> Self {
         let mut catalogs = HashMap::new();
 
         // Auto-register the "jsonfusion" catalog with "public" schema
-        let jsonfusion_catalog = Arc::new(JsonFusionCatalogProvider::new(base_dir.clone()));
+        let jsonfusion_catalog = Arc::new(JsonFusionCatalogProvider::new(
+            base_dir.clone(),
+            jsonfusion_columns.clone(),
+        ));
         catalogs.insert(
             "jsonfusion".to_string(),
             jsonfusion_catalog as Arc<dyn CatalogProvider>,
@@ -317,6 +358,7 @@ impl JsonFusionCatalogProviderList {
         Self {
             base_dir,
             catalogs: RwLock::new(catalogs),
+            jsonfusion_columns,
         }
     }
 
@@ -325,7 +367,10 @@ impl JsonFusionCatalogProviderList {
         let catalogs = self.catalogs.read().unwrap();
         if let Some(jsonfusion_catalog) = catalogs.get("jsonfusion") {
             // Downcast to JsonFusionCatalogProvider to call load_existing_tables
-            if let Some(json_catalog) = jsonfusion_catalog.as_any().downcast_ref::<JsonFusionCatalogProvider>() {
+            if let Some(json_catalog) = jsonfusion_catalog
+                .as_any()
+                .downcast_ref::<JsonFusionCatalogProvider>()
+            {
                 json_catalog.load_existing_tables().await?;
             } else {
                 eprintln!("Warning: jsonfusion catalog is not a JsonFusionCatalogProvider");
