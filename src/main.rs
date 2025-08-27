@@ -3,6 +3,7 @@ mod schema;
 mod table_provider;
 mod type_planner;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::execution::SessionStateBuilder;
@@ -10,10 +11,18 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_postgres::{ServerOptions, serve};
 
+use crate::table_provider::JsonFusionCatalogProviderList;
+
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
+    // Define hardcoded base directory for JSON files
+    let json_base_dir = PathBuf::from("./jsonfusion");
+
     // Configure a 4k batch size
-    let config = SessionConfig::new().with_batch_size(4 * 1024);
+    let config = SessionConfig::new()
+        .with_batch_size(4 * 1024)
+        .with_default_catalog_and_schema("jsonfusion", "public")
+        .with_create_default_catalog_and_schema(false);
 
     // configure a memory limit of 1GB with 20%  slop
     let runtime_env = RuntimeEnvBuilder::new()
@@ -26,12 +35,14 @@ async fn main() -> Result<(), std::io::Error> {
         .with_config(config)
         .with_runtime_env(runtime_env)
         .with_type_planner(Arc::new(type_planner::JsonTypePlanner))
+        .with_catalog_list(Arc::new(JsonFusionCatalogProviderList::new(json_base_dir)))
         // include support for built in functions and configurations
         .with_default_features()
         .build();
 
     // Create a SessionContext
     let session_context = Arc::new(SessionContext::from(state));
+    datafusion_postgres::pg_catalog::setup_pg_catalog(&session_context, "jsonfusion").unwrap();
 
     // Start the Postgres compatible server with SSL/TLS
     let server_options = ServerOptions::new()

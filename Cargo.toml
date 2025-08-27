@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.99"
 arrow = "56.1.0"
 arrow-schema = { version = "56.1.0", features = ["serde"] }
+async-trait = "0.1.89"
 datafusion = "49.0.2"
 datafusion-common = "49.0.2"
 datafusion-expr = "49.0.2"

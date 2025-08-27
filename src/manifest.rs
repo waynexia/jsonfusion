@@ -20,11 +20,11 @@ impl PartialEq for FileMeta {
     }
 }
 
+#[derive(Debug)]
 pub struct Manifest {
-    base_dir: PathBuf,
-    file_lists: HashMap<Uuid, FileMeta>,
-
-    next_manifest_id: u64,
+    pub base_dir: PathBuf,
+    pub file_lists: HashMap<Uuid, FileMeta>,
+    pub next_manifest_id: u64,
 }
 
 impl Manifest {
