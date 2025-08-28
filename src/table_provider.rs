@@ -245,7 +245,25 @@ impl SchemaProvider for JsonFusionSchemaProvider {
 
     fn deregister_table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         let mut tables = self.tables.write().unwrap();
-        Ok(tables.remove(name))
+        let removed_table = tables.remove(name);
+        
+        if removed_table.is_some() {
+            // Remove the filesystem directory for this table
+            let table_dir = self.base_dir.join(name);
+            let table_name = name.to_string();
+            let handle = tokio::runtime::Handle::current();
+            std::thread::spawn(move || {
+                handle.block_on(async move {
+                    if let Err(e) = tokio::fs::remove_dir_all(&table_dir).await {
+                        eprintln!("Warning: Failed to remove table directory {:?}: {}", table_dir, e);
+                    } else {
+                        println!("Dropped table '{}' and removed directory", table_name);
+                    }
+                })
+            }).join().unwrap();
+        }
+        
+        Ok(removed_table)
     }
 
     fn table_exist(&self, name: &str) -> bool {
