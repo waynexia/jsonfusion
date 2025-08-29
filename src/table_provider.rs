@@ -12,6 +12,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
+use datafusion_expr::dml::InsertOp;
 
 use crate::manifest::Manifest;
 
@@ -97,6 +98,15 @@ impl TableProvider for JsonTableProvider {
             TableProviderFilterPushDown::Unsupported;
             filters.len()
         ])
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        todo!()
     }
 }
 
@@ -246,7 +256,7 @@ impl SchemaProvider for JsonFusionSchemaProvider {
     fn deregister_table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         let mut tables = self.tables.write().unwrap();
         let removed_table = tables.remove(name);
-        
+
         if removed_table.is_some() {
             // Remove the filesystem directory for this table
             let table_dir = self.base_dir.join(name);
@@ -255,14 +265,19 @@ impl SchemaProvider for JsonFusionSchemaProvider {
             std::thread::spawn(move || {
                 handle.block_on(async move {
                     if let Err(e) = tokio::fs::remove_dir_all(&table_dir).await {
-                        eprintln!("Warning: Failed to remove table directory {:?}: {}", table_dir, e);
+                        eprintln!(
+                            "Warning: Failed to remove table directory {:?}: {}",
+                            table_dir, e
+                        );
                     } else {
                         println!("Dropped table '{}' and removed directory", table_name);
                     }
                 })
-            }).join().unwrap();
+            })
+            .join()
+            .unwrap();
         }
-        
+
         Ok(removed_table)
     }
 

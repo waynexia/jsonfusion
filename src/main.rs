@@ -1,3 +1,4 @@
+mod convert_writer;
 mod manifest;
 mod schema;
 mod table_provider;
