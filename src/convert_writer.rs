@@ -388,8 +388,6 @@ impl ConvertWriterExec {
 pub struct JsonSchemaInferrer {
     /// Inferred field schemas indexed by field name
     field_schemas: HashMap<String, DataType>,
-    /// Track if we've seen null values for fields
-    nullable_fields: HashMap<String, bool>,
 }
 
 impl Default for JsonSchemaInferrer {
@@ -403,7 +401,6 @@ impl JsonSchemaInferrer {
     pub fn new() -> Self {
         Self {
             field_schemas: HashMap::new(),
-            nullable_fields: HashMap::new(),
         }
     }
 
@@ -417,7 +414,6 @@ impl JsonSchemaInferrer {
                     let obj = value.as_object().unwrap();
                     for (key, val) in obj.iter() {
                         let field_type = self.infer_from_json_value(val)?;
-                        let is_nullable = val.value_type() == ValueType::Null;
 
                         // Merge with existing field type if present
                         if let Some(existing_type) = self.field_schemas.get(key) {
@@ -427,18 +423,11 @@ impl JsonSchemaInferrer {
                         } else {
                             self.field_schemas.insert(key.clone(), field_type);
                         }
-
-                        // Update nullable information
-                        let existing_nullable = *self.nullable_fields.get(key).unwrap_or(&false);
-                        self.nullable_fields
-                            .insert(key.clone(), existing_nullable || is_nullable);
                     }
                 } else {
                     // For non-object top-level values, create a single field
                     let data_type = self.infer_from_json_value(&value)?;
                     self.field_schemas.insert("value".to_string(), data_type);
-                    self.nullable_fields
-                        .insert("value".to_string(), value.value_type() == ValueType::Null);
                 }
                 Ok(())
             }
@@ -480,9 +469,7 @@ impl JsonSchemaInferrer {
                 let mut struct_fields = Vec::new();
                 for (key, val) in obj.iter() {
                     let field_type = self.infer_from_json_value(val)?;
-                    let is_nullable = val.value_type() == ValueType::Null
-                        || *self.nullable_fields.get(key).unwrap_or(&true);
-                    struct_fields.push(Field::new(key, field_type, is_nullable));
+                    struct_fields.push(Field::new(key, field_type, true));
                 }
                 struct_fields.sort_unstable_by(|a, b| a.name().cmp(b.name()));
                 Ok(DataType::Struct(struct_fields.into()))
@@ -524,10 +511,7 @@ impl JsonSchemaInferrer {
                 }
             }
 
-            // Merge nullable information
-            let is_nullable = *self.nullable_fields.get(field_name).unwrap_or(&false)
-                || *other.nullable_fields.get(field_name).unwrap_or(&false);
-            self.nullable_fields.insert(field_name.clone(), is_nullable);
+            // All fields are nullable in simplified inference
         }
         Ok(())
     }
@@ -574,8 +558,7 @@ impl JsonSchemaInferrer {
     pub fn to_arrow_schema(&self) -> Schema {
         let mut fields = Vec::new();
         for (name, data_type) in &self.field_schemas {
-            let is_nullable = *self.nullable_fields.get(name).unwrap_or(&true);
-            fields.push(Field::new(name, data_type.clone(), is_nullable));
+            fields.push(Field::new(name, data_type.clone(), true));
         }
         fields.sort_unstable_by(|a, b| a.name().cmp(b.name()));
         Schema::new(fields)
@@ -642,48 +625,34 @@ impl JsonSchemaInferrer {
 
     /// Merge schemas from multiple objects in an array
     fn merge_object_schemas_from_array(&mut self, objects: &[&OwnedValue]) -> Result<DataType> {
-        let mut unified_fields: HashMap<String, (DataType, bool)> = HashMap::new(); // (type, is_required)
-        let total_objects = objects.len();
+        let mut unified_fields: HashMap<String, DataType> = HashMap::new();
 
         // Process each object and collect field information
         for obj_value in objects {
             if let Some(obj) = obj_value.as_object() {
                 for (key, val) in obj.iter() {
                     let field_type = self.infer_from_json_value(val)?;
-                    let is_nullable = val.value_type() == ValueType::Null;
 
                     match unified_fields.get(key) {
-                        Some((existing_type, existing_required)) => {
-                            // Field exists in multiple objects - merge types and update requirement
+                        Some(existing_type) => {
+                            // Field exists in multiple objects - merge types
                             let merged_type =
                                 self.resolve_type_conflict(existing_type, &field_type)?;
-                            let still_required = *existing_required && !is_nullable;
-                            unified_fields.insert(key.clone(), (merged_type, still_required));
+                            unified_fields.insert(key.clone(), merged_type);
                         }
                         None => {
-                            // New field - it's optional since it doesn't appear in all objects
-                            unified_fields.insert(key.clone(), (field_type, false));
+                            // New field
+                            unified_fields.insert(key.clone(), field_type);
                         }
                     }
                 }
             }
         }
 
-        // Build Arrow struct fields
+        // Build Arrow struct fields - all fields are nullable
         let mut struct_fields = Vec::new();
-        for (field_name, (data_type, is_required)) in unified_fields {
-            // A field is only non-nullable if it appears in ALL objects and is never null
-            let field_count = objects
-                .iter()
-                .filter(|obj| {
-                    obj.as_object()
-                        .map(|o| o.contains_key(&field_name))
-                        .unwrap_or(false)
-                })
-                .count();
-
-            let is_nullable = !is_required || field_count < total_objects;
-            struct_fields.push(Field::new(&field_name, data_type, is_nullable));
+        for (field_name, data_type) in unified_fields {
+            struct_fields.push(Field::new(&field_name, data_type, true));
         }
 
         struct_fields.sort_unstable_by(|a, b| a.name().cmp(b.name()));
@@ -781,7 +750,7 @@ mod tests {
     fn test_identify_json_columns_no_metadata() {
         // Create schema with no JSONFUSION metadata
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
+            Field::new("id", DataType::Int64, true),
             Field::new("name", DataType::Utf8, true),
         ]));
 
@@ -796,7 +765,7 @@ mod tests {
         metadata.insert("JSONFUSION".to_string(), "true".to_string());
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
+            Field::new("id", DataType::Int64, true),
             Field::new("data", DataType::Utf8, true).with_metadata(metadata.clone()),
             Field::new("name", DataType::Utf8, true),
         ]));
@@ -813,7 +782,7 @@ mod tests {
         metadata.insert("JSONFUSION".to_string(), "true".to_string());
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
+            Field::new("id", DataType::Int64, true),
             Field::new("user_data", DataType::Utf8, true).with_metadata(metadata.clone()),
             Field::new("name", DataType::Utf8, true),
             Field::new("config_data", DataType::Utf8, true).with_metadata(metadata.clone()),
@@ -832,7 +801,7 @@ mod tests {
         metadata.insert("JSONFUSION".to_string(), "false".to_string());
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
+            Field::new("id", DataType::Int64, true),
             Field::new("data", DataType::Utf8, true).with_metadata(metadata),
         ]));
 
@@ -846,7 +815,7 @@ mod tests {
         metadata.insert("JSONFUSION".to_string(), "true".to_string());
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
+            Field::new("id", DataType::Int64, true),
             Field::new("json_data", DataType::Utf8, true).with_metadata(metadata),
         ]));
 
@@ -880,11 +849,11 @@ mod tests {
         let inferred_schema = inferrer.to_arrow_schema();
 
         // Construct exact expected schema - fields follow HashMap iteration order: age, active, name
-        // Top-level object fields are non-nullable when they appear in the JSON
+        // All fields are nullable in simplified inference
         let expected_schema = Schema::new(vec![
-            Field::new("active", DataType::Boolean, false),
-            Field::new("age", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("age", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
         ]);
 
         assert_eq!(
@@ -907,7 +876,7 @@ mod tests {
         let inferred_schema = inferrer.to_arrow_schema();
 
         // Construct exact expected nested schema
-        // Top-level object fields are non-nullable, nested struct fields are also non-nullable when they appear
+        // All fields are nullable in simplified inference
         let details_struct = DataType::Struct(
             vec![
                 Field::new("city", DataType::Utf8, true),
@@ -924,7 +893,7 @@ mod tests {
             .into(),
         );
 
-        let expected_schema = Schema::new(vec![Field::new("user", user_struct, false)]);
+        let expected_schema = Schema::new(vec![Field::new("user", user_struct, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
@@ -946,13 +915,13 @@ mod tests {
         let inferred_schema = inferrer.to_arrow_schema();
 
         // Construct exact expected schema with precise List types
-        // Top-level object fields are non-nullable, array items are nullable
+        // All fields are nullable in simplified inference
         let numbers_list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
         let tags_list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
 
         let expected_schema = Schema::new(vec![
-            Field::new("numbers", numbers_list_type, false),
-            Field::new("tags", tags_list_type, false),
+            Field::new("numbers", numbers_list_type, true),
+            Field::new("tags", tags_list_type, true),
         ]);
 
         assert_eq!(
@@ -976,7 +945,7 @@ mod tests {
         metadata.insert("JSONFUSION".to_string(), "true".to_string());
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
+            Field::new("id", DataType::Int64, true),
             Field::new("user_data", DataType::Utf8, true).with_metadata(metadata),
             Field::new("name", DataType::Utf8, true),
         ]));
@@ -1045,15 +1014,15 @@ mod tests {
         let inferred_schema = inferrer.to_arrow_schema();
 
         // Construct exact expected schema for array of structs with merged fields
-        // Top-level array is non-nullable, but struct fields within array are nullable when they don't appear in all objects
+        // All fields are nullable in simplified inference
         let merged_struct_type = DataType::Struct(
             vec![
-                // Fields ordered alphabetically, all nullable since they don't appear in all objects
-                Field::new("active", DataType::Boolean, true), // only in 3rd object -> nullable
-                Field::new("age", DataType::Int64, true), // in 1st and 2nd objects -> nullable since missing from 3rd
-                Field::new("city", DataType::Utf8, true), // only in 2nd object -> nullable
-                Field::new("department", DataType::Utf8, true), // only in 3rd object -> nullable
-                Field::new("name", DataType::Utf8, true), // in all objects -> still nullable since this is array processing
+                // Fields ordered alphabetically, all nullable in simplified inference
+                Field::new("active", DataType::Boolean, true),
+                Field::new("age", DataType::Int64, true),
+                Field::new("city", DataType::Utf8, true),
+                Field::new("department", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, true),
             ]
             .into(),
         );
@@ -1061,7 +1030,7 @@ mod tests {
         let array_list_type =
             DataType::List(Arc::new(Field::new("item", merged_struct_type, true)));
 
-        let expected_schema = Schema::new(vec![Field::new("value", array_list_type, false)]);
+        let expected_schema = Schema::new(vec![Field::new("value", array_list_type, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
@@ -1089,9 +1058,9 @@ mod tests {
         let struct_with_conflict_type = DataType::Struct(
             vec![
                 // Type conflict between Int64 and Utf8 resolves to Utf8
-                // Fields in array structs are nullable if they don't appear in ALL objects consistently
-                Field::new("age", DataType::Utf8, true), // appears in both but conflicts resolve to Utf8, nullable
-                Field::new("name", DataType::Utf8, true), // appears in both as Utf8, still nullable
+                // All fields are nullable in simplified inference 
+                Field::new("age", DataType::Utf8, true), // conflicts resolved to Utf8
+                Field::new("name", DataType::Utf8, true),
             ]
             .into(),
         );
@@ -1102,7 +1071,7 @@ mod tests {
             true,
         )));
 
-        let expected_schema = Schema::new(vec![Field::new("value", array_list_type, false)]);
+        let expected_schema = Schema::new(vec![Field::new("value", array_list_type, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
@@ -1133,16 +1102,16 @@ mod tests {
 
         let user_struct_type = DataType::Struct(
             vec![
-                Field::new("active", DataType::Boolean, true), // only in 2nd object -> nullable
-                Field::new("name", DataType::Utf8, true), // in both objects -> still nullable (array processing)
-                Field::new("tags", tags_array_type, true), // in both objects -> still nullable (array processing)
+                Field::new("active", DataType::Boolean, true),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("tags", tags_array_type, true),
             ]
             .into(),
         );
 
         let users_array_type = DataType::List(Arc::new(Field::new("item", user_struct_type, true)));
 
-        let expected_schema = Schema::new(vec![Field::new("users", users_array_type, false)]);
+        let expected_schema = Schema::new(vec![Field::new("users", users_array_type, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
@@ -1178,7 +1147,7 @@ mod tests {
         let inferred_schema = inferrer.to_arrow_schema();
 
         // Construct exact expected deeply nested schema
-        // Top-level object field is non-nullable, but nested array items are nullable
+        // All fields are nullable in simplified inference
         let member_struct_type = DataType::Struct(
             vec![
                 Field::new("name", DataType::Utf8, true),
@@ -1214,7 +1183,7 @@ mod tests {
         let company_struct_type =
             DataType::Struct(vec![Field::new("departments", departments_array_type, true)].into());
 
-        let expected_schema = Schema::new(vec![Field::new("company", company_struct_type, false)]);
+        let expected_schema = Schema::new(vec![Field::new("company", company_struct_type, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
@@ -1238,7 +1207,7 @@ mod tests {
         // Mixed primitives should fall back to string
         let mixed_array_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
 
-        let expected_schema = Schema::new(vec![Field::new("value", mixed_array_type, false)]);
+        let expected_schema = Schema::new(vec![Field::new("value", mixed_array_type, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
@@ -1263,7 +1232,7 @@ mod tests {
         let inner_array_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
         let outer_array_type = DataType::List(Arc::new(Field::new("item", inner_array_type, true)));
 
-        let expected_schema = Schema::new(vec![Field::new("value", outer_array_type, false)]);
+        let expected_schema = Schema::new(vec![Field::new("value", outer_array_type, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
@@ -1289,7 +1258,7 @@ mod tests {
         let outer_array_type = DataType::List(Arc::new(Field::new("item", inner_array_type, true)));
 
         let expected_schema =
-            Schema::new(vec![Field::new("mixed_arrays", outer_array_type, false)]);
+            Schema::new(vec![Field::new("mixed_arrays", outer_array_type, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
@@ -1314,18 +1283,18 @@ mod tests {
 
         let inferred_schema = inferrer.to_arrow_schema();
 
-        // Both fields should be nullable due to missing/null values
+        // All fields are nullable in simplified inference
         let struct_with_nulls_type = DataType::Struct(
             vec![
-                Field::new("age", DataType::Int64, true), // missing from first two objects -> nullable
-                Field::new("name", DataType::Utf8, true), // null in third object -> nullable
+                Field::new("age", DataType::Int64, true),
+                Field::new("name", DataType::Utf8, true),
             ]
             .into(),
         );
 
         let array_type = DataType::List(Arc::new(Field::new("item", struct_with_nulls_type, true)));
 
-        let expected_schema = Schema::new(vec![Field::new("value", array_type, false)]);
+        let expected_schema = Schema::new(vec![Field::new("value", array_type, true)]);
 
         assert_eq!(
             inferred_schema, expected_schema,
