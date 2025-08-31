@@ -13,8 +13,11 @@ use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 use datafusion_expr::dml::InsertOp;
+use uuid::Uuid;
 
-use crate::manifest::Manifest;
+use crate::convert_writer::ConvertWriterExec;
+use crate::manifest::{FileMeta, Manifest, ManifestUpdaterExec};
+use crate::schema::JsonFusionTableSchema;
 
 #[derive(Debug)]
 pub struct JsonTableProvider {
@@ -50,7 +53,7 @@ impl JsonTableProvider {
         let given_schema: ArrowSchemaRef = serde_json::from_str(&given_schema_json)?;
 
         let manifest = Manifest::create_or_load(base_dir.clone()).await?;
-        let full_schema = given_schema.clone();
+        let full_schema = manifest.get_merged_arrow_schema();
 
         Ok(Self {
             base_dir,
@@ -102,11 +105,33 @@ impl TableProvider for JsonTableProvider {
 
     async fn insert_into(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
+        _insert_op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        todo!()
+        // Generate new UUID for the file
+        let file_id = Uuid::new_v4();
+
+        // Create file path within the table's base_dir
+        let file_path = self.base_dir.join(format!("{}.parquet", file_id));
+
+        // Create ConvertWriterExec to handle JSON processing and Parquet writing
+        let convert_writer =
+            ConvertWriterExec::new(self.given_schema.clone(), input, file_path.clone(), None)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to create ConvertWriterExec: {}", e))
+                })?;
+
+        // Create a wrapper execution plan that updates the manifest after successful write
+        // Pass file_id and given_schema - ManifestUpdaterExec will create FileMeta with expanded schema
+        let manifest_updater = ManifestUpdaterExec::new(
+            Arc::new(convert_writer),
+            self.base_dir.clone(),
+            file_id,
+            self.given_schema.clone(),
+        )?;
+
+        Ok(Arc::new(manifest_updater))
     }
 }
 

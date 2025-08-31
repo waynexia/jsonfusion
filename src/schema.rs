@@ -9,6 +9,26 @@ pub struct JsonFusionTableSchema {
     columns: Vec<JsonFusionTableColumn>,
 }
 
+impl JsonFusionTableSchema {
+    pub fn from_arrow_schema(schema: ArrowSchemaRef) -> Self {
+        let columns: Vec<JsonFusionTableColumn> = schema
+            .fields()
+            .iter()
+            .map(|field| JsonFusionTableColumn::PlainArrow(field.clone()))
+            .collect();
+
+        Self {
+            corresponding_arrow_schema: schema,
+            columns,
+        }
+    }
+
+    /// Get the corresponding Arrow schema
+    pub fn arrow_schema(&self) -> &ArrowSchemaRef {
+        &self.corresponding_arrow_schema
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JsonFusionTableColumn {
     PlainArrow(ArrowFieldRef),
