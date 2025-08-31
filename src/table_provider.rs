@@ -16,8 +16,7 @@ use datafusion_expr::dml::InsertOp;
 use uuid::Uuid;
 
 use crate::convert_writer::ConvertWriterExec;
-use crate::manifest::{FileMeta, Manifest, ManifestUpdaterExec};
-use crate::schema::JsonFusionTableSchema;
+use crate::manifest::{Manifest, ManifestUpdaterExec};
 
 #[derive(Debug)]
 pub struct JsonTableProvider {
@@ -53,7 +52,7 @@ impl JsonTableProvider {
         let given_schema: ArrowSchemaRef = serde_json::from_str(&given_schema_json)?;
 
         let manifest = Manifest::create_or_load(base_dir.clone()).await?;
-        let full_schema = manifest.get_merged_arrow_schema();
+        let full_schema = manifest.get_merged_arrow_schema().await;
 
         Ok(Self {
             base_dir,
@@ -126,7 +125,7 @@ impl TableProvider for JsonTableProvider {
         // Pass file_id and given_schema - ManifestUpdaterExec will create FileMeta with expanded schema
         let manifest_updater = ManifestUpdaterExec::new(
             Arc::new(convert_writer),
-            self.base_dir.clone(),
+            self.manifest.clone(),
             file_id,
             self.given_schema.clone(),
         )?;

@@ -12,9 +12,10 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties,
     SendableRecordBatchStream,
 };
-use datafusion_common::{DataFusionError, Result as DataFusionResult2, Result as DataFusionResult};
+use datafusion_common::{DataFusionError, Result as DataFusionResult};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::convert_writer::ConvertWriterExec;
@@ -38,14 +39,14 @@ impl PartialEq for FileMeta {
     }
 }
 
-#[derive(Debug)]
-pub struct Manifest {
+#[derive(Debug, Clone)]
+pub struct ManifestInner {
     pub base_dir: PathBuf,
     pub file_lists: HashMap<Uuid, FileMeta>,
     pub next_manifest_id: u64,
 }
 
-impl Manifest {
+impl ManifestInner {
     pub async fn create_or_load(base_dir: PathBuf) -> Result<Self> {
         let manifest_path = base_dir.join("manifest");
         tokio::fs::create_dir_all(&manifest_path).await?;
@@ -190,6 +191,58 @@ impl Manifest {
     }
 }
 
+/// Thread-safe wrapper around ManifestInner
+#[derive(Debug, Clone)]
+pub struct Manifest {
+    inner: Arc<RwLock<ManifestInner>>,
+}
+
+impl Manifest {
+    /// Create or load a manifest from the base directory
+    pub async fn create_or_load(base_dir: PathBuf) -> Result<Self> {
+        let inner = ManifestInner::create_or_load(base_dir).await?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(inner)),
+        })
+    }
+
+    /// Get merged Arrow schema from all files in manifest  
+    pub async fn get_merged_arrow_schema(&self) -> ArrowSchemaRef {
+        let inner = self.inner.read().await;
+        inner.get_merged_arrow_schema()
+    }
+
+    /// Add files to the manifest
+    pub async fn add_files(&self, file_metas: Vec<FileMeta>) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.add_files(file_metas).await?;
+
+        Ok(())
+    }
+
+    /// Remove files from the manifest  
+    pub async fn remove_files(&self, file_ids: Vec<Uuid>) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.remove_files(file_ids).await?;
+
+        Ok(())
+    }
+
+    /// Add and remove files in a single operation
+    pub async fn add_and_remove_files(
+        &self,
+        add_file_metas: Vec<FileMeta>,
+        remove_file_ids: Vec<Uuid>,
+    ) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner
+            .add_and_remove_files(add_file_metas, remove_file_ids)
+            .await?;
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ManifestEntry {
     Add(Vec<FileMeta>),
@@ -203,8 +256,8 @@ pub enum ManifestEntry {
 pub struct ManifestUpdaterExec {
     /// The underlying ConvertWriterExec
     inner: Arc<dyn ExecutionPlan>,
-    /// Base directory for manifest updates
-    base_dir: PathBuf,
+    /// Shared manifest for updates
+    manifest: Manifest,
     /// File ID for the manifest entry
     file_id: Uuid,
     /// Given schema (to create JsonFusionTableSchema when expanded schema is not available)
@@ -214,13 +267,13 @@ pub struct ManifestUpdaterExec {
 impl ManifestUpdaterExec {
     pub fn new(
         inner: Arc<dyn ExecutionPlan>,
-        base_dir: PathBuf,
+        manifest: Manifest,
         file_id: Uuid,
         given_schema: ArrowSchemaRef,
     ) -> DataFusionResult<Self> {
         Ok(Self {
             inner,
-            base_dir,
+            manifest,
             file_id,
             given_schema,
         })
@@ -264,7 +317,7 @@ impl ExecutionPlan for ManifestUpdaterExec {
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult2<Arc<dyn ExecutionPlan>> {
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
                 "ManifestUpdaterExec expects exactly one child, got {}",
@@ -274,7 +327,7 @@ impl ExecutionPlan for ManifestUpdaterExec {
 
         Ok(Arc::new(Self {
             inner: children[0].clone(),
-            base_dir: self.base_dir.clone(),
+            manifest: self.manifest.clone(),
             file_id: self.file_id,
             given_schema: self.given_schema.clone(),
         }))
@@ -284,7 +337,7 @@ impl ExecutionPlan for ManifestUpdaterExec {
         &self,
         partition: usize,
         context: Arc<TaskContext>,
-    ) -> DataFusionResult2<SendableRecordBatchStream> {
+    ) -> DataFusionResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(
                 "ManifestUpdaterExec can only be called on partition 0!".to_string(),
@@ -295,9 +348,9 @@ impl ExecutionPlan for ManifestUpdaterExec {
         let inner_stream = self.inner.execute(partition, context)?;
 
         // Create the manifest update logic
-        let base_dir = self.base_dir.clone();
+        let manifest = self.manifest.clone();
         let file_id = self.file_id;
-        let given_schema = self.given_schema.clone();
+        let _given_schema = self.given_schema.clone();
         let inner_plan = self.inner.clone();
         let count_schema = self.inner.schema();
 
@@ -327,7 +380,7 @@ impl ExecutionPlan for ManifestUpdaterExec {
                             JsonFusionTableSchema::from_arrow_schema(schema_to_use);
                         let file_meta = FileMeta::new(file_id, json_fusion_schema);
 
-                        match update_manifest_async(base_dir, file_meta).await {
+                        match manifest.add_files(vec![file_meta]).await {
                             Ok(()) => {
                                 // Manifest update succeeded, return the result batch
                                 Ok(batch)
@@ -363,14 +416,4 @@ impl ExecutionPlan for ManifestUpdaterExec {
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
-}
-
-/// Helper function to update manifest asynchronously
-async fn update_manifest_async(
-    base_dir: PathBuf,
-    file_meta: FileMeta,
-) -> Result<(), anyhow::Error> {
-    let mut manifest = Manifest::create_or_load(base_dir).await?;
-    manifest.add_files(vec![file_meta]).await?;
-    Ok(())
 }
