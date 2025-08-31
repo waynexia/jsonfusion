@@ -7,6 +7,10 @@ use anyhow::Result;
 use arrow_schema::{Field, Schema, SchemaRef as ArrowSchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider, Session};
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -79,27 +83,66 @@ impl TableProvider for JsonTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // TODO: Implement actual scanning logic based on JSON files
-        // For now, return an error indicating this is not yet implemented
-        Err(DataFusionError::NotImplemented(
-            "JsonTableProvider scanning not yet implemented".to_string(),
-        ))
+        // Get file IDs from manifest
+        let file_ids = self.manifest.get_file_ids().await;
+
+        // If no files, return a simple empty execution plan
+        if file_ids.is_empty() {
+            use datafusion::physical_plan::empty::EmptyExec;
+            return Ok(Arc::new(EmptyExec::new(self.schema())));
+        }
+
+        // Collect all parquet file paths
+        let mut parquet_files = Vec::new();
+        for file_id in file_ids {
+            let file_path = self.base_dir.join(format!("{}.parquet", file_id));
+            if file_path.exists() {
+                parquet_files.push(file_path);
+            }
+        }
+
+        // If still no actual files exist, return empty
+        if parquet_files.is_empty() {
+            use datafusion::physical_plan::empty::EmptyExec;
+            return Ok(Arc::new(EmptyExec::new(self.schema())));
+        }
+
+        let parquet_file_urls = parquet_files
+            .iter()
+            .map(|file_path| {
+                ListingTableUrl::parse(&format!(
+                    "file://{}",
+                    file_path.canonicalize().unwrap().to_string_lossy()
+                ))
+                .map_err(|e| DataFusionError::External(Box::new(e)))
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+
+        let listing_options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension("parquet");
+
+        let config = ListingTableConfig::new_with_multi_paths(parquet_file_urls)
+            .with_listing_options(listing_options)
+            .with_schema(self.schema());
+
+        let listing_table =
+            ListingTable::try_new(config).map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        listing_table.scan(state, projection, filters, limit).await
     }
 
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        // For now, don't support any filter pushdown
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        // Since we delegate to ListingTable which supports parquet filter pushdown,
+        // we can indicate that we support exact filter pushdown for all filters
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     async fn insert_into(

@@ -11,6 +11,8 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_postgres::{ServerOptions, serve};
+use object_store::local::LocalFileSystem;
+use url::Url;
 
 use crate::table_provider::JsonFusionCatalogProviderList;
 
@@ -33,6 +35,11 @@ async fn main() -> Result<(), std::io::Error> {
         .with_memory_limit(1024 * 1024 * 1024, 0.80)
         .build_arc()
         .unwrap();
+
+    // Register local filesystem object store for file:// URLs
+    let local_fs = Arc::new(LocalFileSystem::new());
+    let object_store_url = Url::parse("file://").unwrap();
+    runtime_env.register_object_store(&object_store_url, local_fs);
 
     // Create the catalog system and load existing tables
     let catalog_list = Arc::new(JsonFusionCatalogProviderList::new(

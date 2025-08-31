@@ -241,6 +241,12 @@ impl Manifest {
 
         Ok(())
     }
+
+    /// Get list of file IDs in manifest
+    pub async fn get_file_ids(&self) -> Vec<Uuid> {
+        let inner = self.inner.read().await;
+        inner.file_lists.keys().copied().collect()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1990,12 +1990,14 @@ dependencies = [
  "datafusion-expr",
  "datafusion-postgres",
  "futures",
+ "object_store",
  "parquet",
  "serde",
  "serde_json",
  "simd-json",
  "tempfile",
  "tokio",
+ "url",
  "uuid",
 ]
 
