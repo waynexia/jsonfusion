@@ -1,4 +1,5 @@
 mod convert_writer;
+mod json_display;
 mod manifest;
 mod schema;
 mod table_provider;
@@ -65,6 +66,9 @@ async fn main() -> Result<(), std::io::Error> {
     // Create a SessionContext
     let session_context = Arc::new(SessionContext::from(state));
     datafusion_postgres::pg_catalog::setup_pg_catalog(&session_context, "jsonfusion").unwrap();
+
+    // Register json_display UDF
+    session_context.register_udf(json_display::json_display_udf());
 
     // Start the Postgres compatible server with SSL/TLS
     let server_options = ServerOptions::new()
