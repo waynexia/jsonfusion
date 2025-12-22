@@ -11,6 +11,8 @@ use std::sync::{Arc, RwLock};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_pg_catalog::pg_catalog::context::EmptyContextProvider;
+use datafusion_postgres::auth::AuthManager;
 use datafusion_postgres::{ServerOptions, serve};
 use object_store::local::LocalFileSystem;
 use url::Url;
@@ -66,7 +68,8 @@ async fn main() -> Result<(), std::io::Error> {
 
     // Create a SessionContext
     let session_context = Arc::new(SessionContext::from(state));
-    datafusion_postgres::pg_catalog::setup_pg_catalog(&session_context, "jsonfusion").unwrap();
+    datafusion_pg_catalog::setup_pg_catalog(&session_context, "jsonfusion", EmptyContextProvider)
+        .unwrap();
 
     // Register json_display UDF
     session_context.register_udf(json_display::json_display_udf());
@@ -76,5 +79,10 @@ async fn main() -> Result<(), std::io::Error> {
         .with_host("127.0.0.1".to_string())
         .with_port(5432);
 
-    serve(session_context, &server_options).await
+    serve(
+        session_context,
+        &server_options,
+        Arc::new(AuthManager::new()),
+    )
+    .await
 }

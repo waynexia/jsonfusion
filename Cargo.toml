@@ -5,21 +5,22 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.99"
-arrow = "55.2.0"
-arrow-schema = { version = "55.2.0", features = ["serde"] }
+arrow = "57"
+arrow-schema = { version = "57", features = ["serde"] }
 async-trait = "0.1.89"
-datafusion = "49.0.2"
-datafusion-common = "49.0.2"
-datafusion-expr = "49.0.2"
-datafusion-postgres = "0.9"
+datafusion = "51"
+datafusion-common = "51"
+datafusion-expr = "51"
+datafusion-pg-catalog = "0.13"
+datafusion-postgres = "0.13"
 futures = "0.3.31"
 object_store = "0.12.3"
-url = "2.5.4"
-parquet = "55.2.0"
+parquet = "57"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 simd-json = "0.14"
 tokio = { version = "1.47.1", features = ["full"] }
+url = "2.5.4"
 uuid = { version = "1.18.0", features = ["v7", "serde"] }
 
 [dev-dependencies]
