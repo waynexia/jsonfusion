@@ -278,9 +278,7 @@ impl ConvertWriterExec {
                         if !string_array.is_null(i) {
                             let json_str = string_array.value(i);
                             // Parse once, store and infer schema
-                            if let Err(e) = processor.process_json_string(i, json_str) {
-                                return Err(e);
-                            }
+                            processor.process_json_string(i, json_str)?;
                         }
                         // For null values, the processor already has None in that position
                     }
@@ -303,7 +301,7 @@ impl ConvertWriterExec {
                     new_fields.push(Field::new(field.name(), structural_type, true));
                     new_columns.push(structural_array);
                 } else {
-                    println!("[DEBUG] Processor missing for column: {:?}", field.name());
+                    println!("[DEBUG] Processor missing for column: {}", field.name());
                     // Fallback: keep original column if processor missing
                     new_fields.push(field.as_ref().clone());
                     new_columns.push(Arc::clone(column));
@@ -315,7 +313,7 @@ impl ConvertWriterExec {
             }
         }
 
-        println!("[DEBUG] New fields: {:?}", new_fields);
+        println!("[DEBUG] New fields: {new_fields:?}");
 
         // Step 3: Create new RecordBatch with structural replacement
         let new_schema = Arc::new(Schema::new(new_fields));
@@ -382,7 +380,7 @@ impl ConvertWriterExec {
         // Create Parquet writer with the unified expanded schema
         let props = WriterProperties::builder().build();
         let mut writer = ArrowWriter::try_new(file, final_schema.clone(), Some(props))
-            .map_err(|e| datafusion_common::DataFusionError::from(e))?;
+            .map_err(datafusion_common::DataFusionError::from)?;
 
         // Second pass: write all processed batches
         for processed_batch in processed_batches {
@@ -391,20 +389,20 @@ impl ConvertWriterExec {
 
             writer
                 .write(&conforming_batch)
-                .map_err(|e| datafusion_common::DataFusionError::from(e))?;
+                .map_err(datafusion_common::DataFusionError::from)?;
         }
 
         // Finalize the Parquet file
         writer
             .close()
-            .map_err(|e| datafusion_common::DataFusionError::from(e))?;
+            .map_err(datafusion_common::DataFusionError::from)?;
 
         // Store the final expanded schema for ManifestUpdaterExec
-        if let Some(ref final_schema) = unified_schema {
-            if let Ok(mut expanded_lock) = self.expanded_schema.write() {
-                println!("[DEBUG] Storing expanded schema: {:?}", final_schema);
-                *expanded_lock = Some(final_schema.clone());
-            }
+        if let Some(final_schema) = unified_schema.as_ref()
+            && let Ok(mut expanded_lock) = self.expanded_schema.write()
+        {
+            println!("[DEBUG] Storing expanded schema: {final_schema:?}");
+            *expanded_lock = Some(final_schema.clone());
         }
 
         Ok(total_rows)
@@ -823,6 +821,7 @@ impl JsonColumnProcessor {
     }
 
     /// Resolve conflicts when two fields have different types
+    #[allow(clippy::only_used_in_recursion)]
     fn resolve_type_conflict(&self, type1: &DataType, type2: &DataType) -> Result<DataType> {
         use DataType::*;
 
@@ -1135,7 +1134,6 @@ impl JsonColumnProcessor {
     ///          create_array_from_json_values
     /// These hardcoded type-specific methods have been replaced by the universal
     /// schema-driven approach that handles arbitrary nesting levels.
-
     /// Universal array builder factory - creates Arrow builders for any DataType recursively
     fn create_array_builder_for_type(data_type: &DataType) -> Result<Box<dyn ArrayBuilder>> {
         match data_type {
@@ -1158,8 +1156,7 @@ impl JsonColumnProcessor {
             }
             DataType::Null => Ok(Box::new(StringBuilder::new())), // Use string builder for null types
             _ => Err(datafusion_common::DataFusionError::NotImplemented(format!(
-                "Array builder for type {:?} not yet implemented",
-                data_type
+                "Array builder for type {data_type:?} not yet implemented"
             ))),
         }
     }
@@ -1632,8 +1629,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -1671,8 +1667,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -1700,8 +1695,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -1765,12 +1759,11 @@ mod tests {
         ]);
 
         // Verify full schema match
+        let got_schema = processed_batch.schema();
         assert_eq!(
-            processed_batch.schema().as_ref(),
+            got_schema.as_ref(),
             &expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema,
-            processed_batch.schema()
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {got_schema:#?}"
         );
 
         // Verify row count
@@ -1814,8 +1807,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -1855,8 +1847,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -1895,8 +1886,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -1967,8 +1957,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -1991,8 +1980,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -2016,8 +2004,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -2041,8 +2028,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -2077,8 +2063,7 @@ mod tests {
 
         assert_eq!(
             inferred_schema, expected_schema,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_schema, inferred_schema
+            "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
 
         Ok(())
@@ -2179,8 +2164,8 @@ mod tests {
             ))
         })?;
 
-        let parquet_schema = Arc::clone(&builder.schema());
-        let mut reader = builder.build().map_err(|e| {
+        let parquet_schema = Arc::clone(builder.schema());
+        let reader = builder.build().map_err(|e| {
             datafusion_common::DataFusionError::Execution(format!(
                 "Failed to build parquet reader: {e}"
             ))
@@ -2246,7 +2231,7 @@ mod tests {
 
         // Read all data and verify we have 4 rows
         let mut total_rows = 0;
-        while let Some(batch) = reader.next() {
+        for batch in reader {
             let batch = batch.map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
                     "Failed to read parquet batch: {e}"
@@ -2294,8 +2279,7 @@ mod tests {
 
         assert_eq!(
             merged_type, expected_merged_type,
-            "Merged type mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_merged_type, merged_type
+            "Merged type mismatch. Expected: {expected_merged_type:#?}, Got: {merged_type:#?}"
         );
 
         Ok(())
@@ -2358,8 +2342,7 @@ mod tests {
 
         assert_eq!(
             data_type, expected_struct_type,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_struct_type, data_type
+            "Schema mismatch. Expected: {expected_struct_type:#?}, Got: {data_type:#?}"
         );
         assert_eq!(array.len(), 3);
 
@@ -2395,8 +2378,7 @@ mod tests {
 
         assert_eq!(
             data_type, expected_data_type,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_data_type, data_type
+            "Schema mismatch. Expected: {expected_data_type:#?}, Got: {data_type:#?}"
         );
         assert_eq!(array.len(), 2);
         Ok(())
@@ -2418,10 +2400,7 @@ mod tests {
 
         let result = processor.convert_to_structural_array();
         if let Err(ref e) = result {
-            panic!(
-                "Universal approach should handle List<Struct>, but got error: {:?}",
-                e
-            );
+            panic!("Universal approach should handle List<Struct>, but got error: {e:?}");
         }
         assert!(result.is_ok());
 
@@ -2442,8 +2421,7 @@ mod tests {
 
         assert_eq!(
             data_type, expected_data_type,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_data_type, data_type
+            "Schema mismatch. Expected: {expected_data_type:#?}, Got: {data_type:#?}"
         );
         assert_eq!(array.len(), 2);
         Ok(())
@@ -2487,8 +2465,7 @@ mod tests {
 
         assert_eq!(
             data_type, expected_struct_type,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_struct_type, data_type
+            "Schema mismatch. Expected: {expected_struct_type:#?}, Got: {data_type:#?}"
         );
         assert_eq!(array.len(), 2);
         Ok(())
@@ -2511,10 +2488,7 @@ mod tests {
 
         let result = processor.convert_to_structural_array();
         if let Err(ref e) = result {
-            panic!(
-                "Universal approach should handle deeply nested types, but got error: {:?}",
-                e
-            );
+            panic!("Universal approach should handle deeply nested types, but got error: {e:?}");
         }
         assert!(result.is_ok());
 
@@ -2535,8 +2509,7 @@ mod tests {
 
         assert_eq!(
             data_type, expected_data_type,
-            "Schema mismatch. Expected: {:#?}, Got: {:#?}",
-            expected_data_type, data_type
+            "Schema mismatch. Expected: {expected_data_type:#?}, Got: {data_type:#?}"
         );
         assert_eq!(array.len(), 2);
         Ok(())

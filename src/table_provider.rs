@@ -100,7 +100,7 @@ impl TableProvider for JsonTableProvider {
         // Collect all parquet file paths
         let mut parquet_files = Vec::new();
         for file_id in file_ids {
-            let file_path = self.base_dir.join(format!("{}.parquet", file_id));
+            let file_path = self.base_dir.join(format!("{file_id}.parquet"));
             if file_path.exists() {
                 parquet_files.push(file_path);
             }
@@ -115,7 +115,7 @@ impl TableProvider for JsonTableProvider {
         let parquet_file_urls = parquet_files
             .iter()
             .map(|file_path| {
-                ListingTableUrl::parse(&format!(
+                ListingTableUrl::parse(format!(
                     "file://{}",
                     file_path.canonicalize().unwrap().to_string_lossy()
                 ))
@@ -155,13 +155,13 @@ impl TableProvider for JsonTableProvider {
         let file_id = Uuid::new_v4();
 
         // Create file path within the table's base_dir
-        let file_path = self.base_dir.join(format!("{}.parquet", file_id));
+        let file_path = self.base_dir.join(format!("{file_id}.parquet"));
 
         // Create ConvertWriterExec to handle JSON processing and Parquet writing
         let convert_writer =
             ConvertWriterExec::new(self.given_schema.clone(), input, file_path.clone(), None)
                 .map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to create ConvertWriterExec: {}", e))
+                    DataFusionError::Execution(format!("Failed to create ConvertWriterExec: {e}"))
                 })?;
 
         // Create a wrapper execution plan that updates the manifest after successful write
@@ -219,7 +219,7 @@ impl JsonFusionSchemaProvider {
                 Some(name) => match name.to_str() {
                     Some(name_str) => name_str.to_string(),
                     None => {
-                        eprintln!("Warning: Invalid directory name in {:?}", entry_path);
+                        eprintln!("Warning: Invalid directory name in {entry_path:?}");
                         continue;
                     }
                 },
@@ -240,10 +240,10 @@ impl JsonFusionSchemaProvider {
                     let table_arc = Arc::new(table_provider);
                     let mut tables = self.tables.write().unwrap();
                     tables.insert(table_name.clone(), table_arc);
-                    println!("Loaded existing table: {}", table_name);
+                    println!("Loaded existing table: {table_name}");
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load table from {:?}: {}", entry_path, e);
+                    eprintln!("Warning: Failed to load table from {entry_path:?}: {e}");
                     continue;
                 }
             }
@@ -276,8 +276,7 @@ impl SchemaProvider for JsonFusionSchemaProvider {
     ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         // Get and clear the JSONFUSION columns from shared state
         let jsonfusion_column_names = if let Ok(mut columns) = self.jsonfusion_columns.write() {
-            let names = std::mem::take(&mut *columns);
-            names
+            std::mem::take(&mut *columns)
         } else {
             Vec::new()
         };
@@ -332,12 +331,9 @@ impl SchemaProvider for JsonFusionSchemaProvider {
             std::thread::spawn(move || {
                 handle.block_on(async move {
                     if let Err(e) = tokio::fs::remove_dir_all(&table_dir).await {
-                        eprintln!(
-                            "Warning: Failed to remove table directory {:?}: {}",
-                            table_dir, e
-                        );
+                        eprintln!("Warning: Failed to remove table directory {table_dir:?}: {e}");
                     } else {
-                        println!("Dropped table '{}' and removed directory", table_name);
+                        println!("Dropped table '{table_name}' and removed directory");
                     }
                 })
             })
@@ -356,8 +352,10 @@ impl SchemaProvider for JsonFusionSchemaProvider {
 
 #[derive(Debug)]
 pub struct JsonFusionCatalogProvider {
+    #[allow(dead_code)]
     base_dir: PathBuf,
     schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
+    #[allow(dead_code)]
     jsonfusion_columns: Arc<RwLock<Vec<String>>>,
 }
 
@@ -384,8 +382,12 @@ impl JsonFusionCatalogProvider {
 
     pub async fn load_existing_tables(&self) -> Result<()> {
         // Get the public schema and load existing tables
-        let schemas = self.schemas.read().unwrap();
-        if let Some(public_schema) = schemas.get("public") {
+        let public_schema = {
+            let schemas = self.schemas.read().unwrap();
+            schemas.get("public").cloned()
+        };
+
+        if let Some(public_schema) = public_schema {
             // Downcast to JsonFusionSchemaProvider to call load_existing_tables
             if let Some(json_schema) = public_schema
                 .as_any()
@@ -436,8 +438,10 @@ impl CatalogProvider for JsonFusionCatalogProvider {
 
 #[derive(Debug)]
 pub struct JsonFusionCatalogProviderList {
+    #[allow(dead_code)]
     base_dir: PathBuf,
     catalogs: RwLock<HashMap<String, Arc<dyn CatalogProvider>>>,
+    #[allow(dead_code)]
     jsonfusion_columns: Arc<RwLock<Vec<String>>>,
 }
 
@@ -464,8 +468,12 @@ impl JsonFusionCatalogProviderList {
 
     pub async fn load_existing_tables(&self) -> Result<()> {
         // Get the jsonfusion catalog and load existing tables
-        let catalogs = self.catalogs.read().unwrap();
-        if let Some(jsonfusion_catalog) = catalogs.get("jsonfusion") {
+        let jsonfusion_catalog = {
+            let catalogs = self.catalogs.read().unwrap();
+            catalogs.get("jsonfusion").cloned()
+        };
+
+        if let Some(jsonfusion_catalog) = jsonfusion_catalog {
             // Downcast to JsonFusionCatalogProvider to call load_existing_tables
             if let Some(json_catalog) = jsonfusion_catalog
                 .as_any()

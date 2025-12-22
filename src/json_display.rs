@@ -48,7 +48,7 @@ fn convert_array_to_json_strings(array: &ArrayRef) -> Result<ArrayRef> {
                 json_strings.push(None);
             } else {
                 let json_string = serde_json::to_string(&json_value).map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to serialize JSON: {}", e))
+                    DataFusionError::Execution(format!("Failed to serialize JSON: {e}"))
                 })?;
                 json_strings.push(Some(json_string));
             }
@@ -274,15 +274,15 @@ mod tests {
         let string_array = json_strings.as_any().downcast_ref::<StringArray>().unwrap();
 
         // First row: name is "Alice", age is 30
-        let json1: Value = serde_json::from_str(&string_array.value(0))
-            .map_err(|e| DataFusionError::Execution(format!("JSON parse error: {}", e)))?;
+        let json1: Value = serde_json::from_str(string_array.value(0))
+            .map_err(|e| DataFusionError::Execution(format!("JSON parse error: {e}")))?;
         assert_eq!(json1["name"], "Alice");
         assert_eq!(json1["age"], 30);
         assert!(!json1.as_object().unwrap().contains_key("null_field")); // null fields should be omitted
 
         // Second row: name is null (omitted), age is 25
-        let json2: Value = serde_json::from_str(&string_array.value(1))
-            .map_err(|e| DataFusionError::Execution(format!("JSON parse error: {}", e)))?;
+        let json2: Value = serde_json::from_str(string_array.value(1))
+            .map_err(|e| DataFusionError::Execution(format!("JSON parse error: {e}")))?;
         assert!(!json2.as_object().unwrap().contains_key("name")); // null name omitted
         assert_eq!(json2["age"], 25);
 
@@ -316,23 +316,25 @@ mod tests {
         Ok(())
     }
 
-    #[test] 
+    #[test]
     fn test_json_display_empty_and_null_lists() -> datafusion_common::Result<()> {
         use arrow::array::{Int32Array, ListArray};
         use arrow::buffer::OffsetBuffer;
 
         // Create a list array with: empty list, list with all nulls, list with values
         let values = Arc::new(Int32Array::from(vec![
-            None, None, // First two are nulls for second list
-            Some(1), Some(2), // Third list has actual values
+            None,
+            None, // First two are nulls for second list
+            Some(1),
+            Some(2), // Third list has actual values
         ]));
 
         // Offsets: [0, 0, 2, 4] means:
-        // - First list: empty (0 to 0)  
+        // - First list: empty (0 to 0)
         // - Second list: 2 nulls (0 to 2)
         // - Third list: 2 values (2 to 4)
         let offsets = OffsetBuffer::new(vec![0, 0, 2, 4].into());
-        
+
         let field = Arc::new(Field::new("item", DataType::Int32, true));
         let list_array: ArrayRef = Arc::new(ListArray::new(field, offsets, values, None));
 
@@ -341,15 +343,21 @@ mod tests {
 
         // First list is empty - should be null
         assert!(string_array.is_null(0));
-        
-        // Second list has all nulls - should be null 
+
+        // Second list has all nulls - should be null
         assert!(string_array.is_null(1));
-        
+
         // Third list has actual values - should contain JSON
         assert!(!string_array.is_null(2));
-        let json3: Value = serde_json::from_str(&string_array.value(2))
-            .map_err(|e| DataFusionError::Execution(format!("JSON parse error: {}", e)))?;
-        assert_eq!(json3, Value::Array(vec![Value::Number(serde_json::Number::from(1)), Value::Number(serde_json::Number::from(2))]));
+        let json3: Value = serde_json::from_str(string_array.value(2))
+            .map_err(|e| DataFusionError::Execution(format!("JSON parse error: {e}")))?;
+        assert_eq!(
+            json3,
+            Value::Array(vec![
+                Value::Number(serde_json::Number::from(1)),
+                Value::Number(serde_json::Number::from(2))
+            ])
+        );
 
         Ok(())
     }

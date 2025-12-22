@@ -1,5 +1,6 @@
 mod convert_writer;
 mod json_display;
+mod json_path_type_inference;
 mod manifest;
 mod schema;
 mod table_provider;
@@ -51,7 +52,7 @@ async fn main() -> Result<(), std::io::Error> {
         jsonfusion_columns.clone(),
     ));
     if let Err(e) = catalog_list.load_existing_tables().await {
-        eprintln!("Warning: Failed to load some existing tables: {}", e);
+        eprintln!("Warning: Failed to load some existing tables: {e}");
     }
 
     // Create a SessionState using the config and runtime_env
@@ -64,6 +65,10 @@ async fn main() -> Result<(), std::io::Error> {
         .with_catalog_list(catalog_list)
         // include support for built in functions and configurations
         .with_default_features()
+        // run at the very end to print inferred JSON path type sets
+        .with_optimizer_rule(Arc::new(
+            json_path_type_inference::JsonPathTypeInferenceRule::new(),
+        ))
         .build();
 
     // Create a SessionContext

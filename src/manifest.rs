@@ -61,13 +61,12 @@ impl ManifestInner {
 
         let next_manifest_id = manifest_lists
             .last()
-            .map(|path| {
+            .and_then(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .and_then(|name| name.parse::<u64>().ok())
                     .map(|id| id + 1)
             })
-            .flatten()
             .unwrap_or(0);
 
         let mut file_lists = HashMap::new();
@@ -151,6 +150,7 @@ impl ManifestInner {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn remove_files(&mut self, file_ids: Vec<Uuid>) -> Result<()> {
         let manifest_entry = ManifestEntry::Remove(file_ids.clone());
         let manifest_file_path = self
@@ -167,6 +167,7 @@ impl ManifestInner {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn add_and_remove_files(
         &mut self,
         add_file_metas: Vec<FileMeta>,
@@ -221,6 +222,7 @@ impl Manifest {
     }
 
     /// Remove files from the manifest  
+    #[allow(dead_code)]
     pub async fn remove_files(&self, file_ids: Vec<Uuid>) -> Result<()> {
         let mut inner = self.inner.write().await;
         inner.remove_files(file_ids).await?;
@@ -229,6 +231,7 @@ impl Manifest {
     }
 
     /// Add and remove files in a single operation
+    #[allow(dead_code)]
     pub async fn add_and_remove_files(
         &self,
         add_file_metas: Vec<FileMeta>,
@@ -394,8 +397,7 @@ impl ExecutionPlan for ManifestUpdaterExec {
                             Err(e) => {
                                 // Manifest update failed
                                 Err(DataFusionError::Execution(format!(
-                                    "Failed to update manifest: {}",
-                                    e
+                                    "Failed to update manifest: {e}"
                                 )))
                             }
                         }
