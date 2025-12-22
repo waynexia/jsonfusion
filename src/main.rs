@@ -28,6 +28,7 @@ async fn main() -> Result<(), std::io::Error> {
     // Configure a 4k batch size
     let config = SessionConfig::new()
         .with_batch_size(4 * 1024)
+        .with_information_schema(true)
         .with_default_catalog_and_schema("jsonfusion", "public")
         .with_create_default_catalog_and_schema(false);
 

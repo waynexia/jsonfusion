@@ -274,9 +274,9 @@ dependencies = [
 
 [[package]]
 name = "arrow-pg"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdbadb9834911af1ba0e29271c7a24e072614579de50848c3a65be9c09f63e22"
+checksum = "3955e68d66d65bfe29130808a7712f47c4fda1de3840411a6af0aad20af9fa74"
 dependencies = [
  "bytes",
  "chrono",
@@ -1333,9 +1333,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-postgres"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0587011cffd824468b38a2813698d647f0eb468d821d3b900dc3bf0e9fa3939"
+checksum = "bb93693e03dfcf4d384905edcfe3908993a4eca08087b99af2e0ae421db11933"
 dependencies = [
  "arrow-pg",
  "async-trait",
@@ -2821,9 +2821,9 @@ dependencies = [
 
 [[package]]
 name = "rust_decimal"
-version = "1.37.2"
+version = "1.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b203a6425500a03e0919c42d3c47caca51e79f1132046626d2c8871c5092035d"
+checksum = "c8975fc98059f365204d635119cf9c5a60ae67b841ed49b5422a9a7e56cdfac0"
 dependencies = [
  "arrayvec",
  "borsh",
