@@ -3,6 +3,7 @@ mod json_display;
 mod json_path_type_inference;
 mod manifest;
 mod schema;
+mod sql_ast_rewriter;
 mod table_provider;
 mod type_planner;
 
@@ -59,6 +60,9 @@ async fn main() -> Result<(), std::io::Error> {
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime_env)
+        .with_expr_planners(vec![Arc::new(
+            sql_ast_rewriter::JsonFusionExprPlanner::new(),
+        )])
         .with_type_planner(Arc::new(type_planner::JsonTypePlanner::new(
             jsonfusion_columns.clone(),
         )))
