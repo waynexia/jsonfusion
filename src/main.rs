@@ -1,5 +1,6 @@
 mod convert_writer;
 mod get_field_typed;
+mod get_field_typed_type_inference;
 mod json_display;
 mod json_path_type_inference;
 mod manifest;
@@ -13,6 +14,8 @@ use std::sync::{Arc, RwLock};
 
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction;
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_pg_catalog::pg_catalog::context::EmptyContextProvider;
 use datafusion_postgres::auth::AuthManager;
@@ -70,6 +73,11 @@ async fn main() -> Result<(), std::io::Error> {
         .with_catalog_list(catalog_list)
         // include support for built in functions and configurations
         .with_default_features()
+        .with_analyzer_rules(vec![
+            Arc::new(get_field_typed_type_inference::GetFieldTypedTypeInferenceRule::new()),
+            Arc::new(ResolveGroupingFunction::new()),
+            Arc::new(TypeCoercion::new()),
+        ])
         // run at the very end to print inferred JSON path type sets
         .with_optimizer_rule(Arc::new(
             json_path_type_inference::JsonPathTypeInferenceRule::new(),
