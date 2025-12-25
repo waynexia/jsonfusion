@@ -1,10 +1,11 @@
-use datafusion::functions::expr_fn::get_field;
 use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue};
 use datafusion_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion_expr::{Expr, GetFieldAccess};
 
+use crate::get_field_typed::get_field_typed;
+
 /// Rewrites SQL field access (e.g. `data.a.b`) on JSONFusion columns into
-/// `get_field(column, 'a.b')` calls so planning does not depend on the path
+/// `get_field_typed(column, 'a.b')` calls so planning does not depend on the path
 /// existing in the schema.
 #[derive(Debug, Default)]
 pub struct JsonFusionExprPlanner;
@@ -23,18 +24,16 @@ impl JsonFusionExprPlanner {
     }
 
     /// Returns the root JSONFusion column and the currently accumulated path if
-    /// `expr` is either a bare JSONFusion column or a `get_field` built on top
+    /// `expr` is either a bare JSONFusion column or a `get_field_typed` built on top
     /// of one.
-    fn jsonfusion_root_and_path<'a>(
-        &self,
-        expr: &'a Expr,
-        schema: &DFSchema,
-    ) -> Option<(Column, String)> {
+    fn jsonfusion_root_and_path(&self, expr: &Expr, schema: &DFSchema) -> Option<(Column, String)> {
         match expr {
             Expr::Column(column) if self.is_jsonfusion_column(schema, column) => {
                 Some((column.clone(), String::new()))
             }
-            Expr::ScalarFunction(fun) if fun.name() == "get_field" && fun.args.len() == 2 => {
+            Expr::ScalarFunction(fun)
+                if fun.name() == "get_field_typed" && matches!(fun.args.len(), 2 | 3) =>
+            {
                 let key = match &fun.args[1] {
                     Expr::Literal(ScalarValue::Utf8(Some(s)), _)
                     | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => s.clone(),
@@ -95,7 +94,7 @@ impl ExprPlanner for JsonFusionExprPlanner {
         }
         path.push_str(&segment);
 
-        let rewritten = get_field(Expr::Column(column), path);
+        let rewritten = get_field_typed(Expr::Column(column), path, None);
         Ok(PlannerResult::Planned(rewritten))
     }
 }
@@ -163,10 +162,10 @@ mod tests {
         };
 
         let Expr::ScalarFunction(fun) = expr else {
-            panic!("expected get_field function, got {expr:?}");
+            panic!("expected get_field_typed function, got {expr:?}");
         };
 
-        assert_eq!(fun.name(), "get_field");
+        assert_eq!(fun.name(), "get_field_typed");
         assert_eq!(fun.args.len(), 2);
 
         match &fun.args[0] {

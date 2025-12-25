@@ -447,12 +447,12 @@ fn unwrap_alias(expr: &Expr) -> &Expr {
     }
 }
 
-fn json_path_from_get_field(expr: &Expr) -> Option<JsonPath> {
+fn json_path_from_get_field_typed(expr: &Expr) -> Option<JsonPath> {
     let Expr::ScalarFunction(fun) = unwrap_alias(expr) else {
         return None;
     };
 
-    if fun.name() != "get_field" || fun.args.len() != 2 {
+    if fun.name() != "get_field_typed" || !matches!(fun.args.len(), 2 | 3) {
         return None;
     }
 
@@ -468,7 +468,7 @@ fn json_path_from_get_field(expr: &Expr) -> Option<JsonPath> {
             segments: vec![key],
         }),
         other => {
-            let mut p = json_path_from_get_field(other)?;
+            let mut p = json_path_from_get_field_typed(other)?;
             p.segments.push(key);
             Some(p)
         }
@@ -479,7 +479,7 @@ fn json_path_through_wrappers(expr: &Expr) -> Option<JsonPath> {
     match unwrap_alias(expr) {
         Expr::Cast(c) => json_path_through_wrappers(c.expr.as_ref()),
         Expr::TryCast(c) => json_path_through_wrappers(c.expr.as_ref()),
-        other => json_path_from_get_field(other),
+        other => json_path_from_get_field_typed(other),
     }
 }
 
@@ -493,7 +493,7 @@ fn json_type_hint(expr: &Expr) -> Option<JsonTypeSet> {
 }
 
 fn analyze_expr(expr: &Expr, expected: Option<JsonTypeSet>, s: &mut InferenceState) {
-    if let Some(path) = json_path_from_get_field(expr) {
+    if let Some(path) = json_path_from_get_field_typed(expr) {
         s.mention(path.clone());
         if let Some(expected) = expected {
             s.restrict(path, expected);
@@ -586,7 +586,7 @@ fn analyze_expr(expr: &Expr, expected: Option<JsonTypeSet>, s: &mut InferenceSta
         }
         Expr::ScalarFunction(fun) => {
             let mut hints = argument_type_hints(fun.func.signature(), fun.args.len());
-            if fun.name() == "get_field" && fun.args.len() == 2 {
+            if fun.name() == "get_field_typed" && matches!(fun.args.len(), 2 | 3) {
                 let mut enforced = hints.unwrap_or_else(|| vec![JsonTypeSet::ALL; fun.args.len()]);
                 if enforced.len() < fun.args.len() {
                     enforced.resize(fun.args.len(), JsonTypeSet::ALL);
@@ -598,6 +598,12 @@ fn analyze_expr(expr: &Expr, expected: Option<JsonTypeSet>, s: &mut InferenceSta
                     *second = second.intersect(JsonTypeSet::STRING);
                 }
                 hints = Some(enforced);
+                if fun.args.len() == 3
+                    && let Some(path) = json_path_from_get_field_typed(expr)
+                    && let Some(hint) = json_type_hint(&fun.args[2])
+                {
+                    s.restrict(path, hint);
+                }
             }
 
             let is_coalesce = fun.name() == "coalesce";
@@ -878,6 +884,7 @@ mod tests {
     use datafusion_expr::ExprSchemable;
 
     use super::{JsonPathTypeInferenceRule, JsonTypeSet};
+    use crate::get_field_typed::get_field_typed;
 
     fn struct_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -923,7 +930,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let expr = datafusion::functions::expr_fn::get_field(col("j"), "a")
+        let expr = get_field_typed(col("j"), "a", Some(lit(ScalarValue::Int64(None))))
             .cast_to(&DataType::Int64, df.schema())?;
 
         let plan = df.select(vec![expr])?.logical_plan().clone();
@@ -941,7 +948,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let predicate = datafusion::functions::expr_fn::get_field(col("j"), "flag");
+        let predicate = get_field_typed(col("j"), "flag", Some(lit(ScalarValue::Boolean(None))));
         let plan = df.filter(predicate)?.logical_plan().clone();
 
         let rule = JsonPathTypeInferenceRule::new();
@@ -957,7 +964,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let x = datafusion::functions::expr_fn::get_field(col("j"), "x");
+        let x = get_field_typed(col("j"), "x", Some(lit(ScalarValue::Int64(None))));
         let predicate = x.clone() + lit(1_i64);
         let plan = df.filter(predicate.gt(lit(10_i64)))?.logical_plan().clone();
 
@@ -965,7 +972,7 @@ mod tests {
         let _ = rule.rewrite(plan, &OptimizerContext::new())?;
         let inferred = rule.last_inferred();
 
-        assert_eq!(inferred.get("j:$.x").copied(), Some(JsonTypeSet::NUMERIC));
+        assert_eq!(inferred.get("j:$.x").copied(), Some(JsonTypeSet::INT64));
         Ok(())
     }
 
@@ -974,7 +981,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let s = datafusion::functions::expr_fn::get_field(col("j"), "s");
+        let s = get_field_typed(col("j"), "s", Some(lit(ScalarValue::Utf8(None))));
         let predicate = s.like(lit("ab%"));
         let plan = df.filter(predicate)?.logical_plan().clone();
 
@@ -991,7 +998,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let s = datafusion::functions::expr_fn::get_field(col("j"), "s");
+        let s = get_field_typed(col("j"), "s", Some(lit(ScalarValue::Utf8(None))));
         let expr = datafusion::functions::expr_fn::lower(s);
         let plan = df.select(vec![expr])?.logical_plan().clone();
 
@@ -1008,7 +1015,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let x = datafusion::functions::expr_fn::get_field(col("j"), "x");
+        let x = get_field_typed(col("j"), "x", Some(lit(ScalarValue::Int64(None))));
         let expr = datafusion::functions::expr_fn::abs(x);
         let plan = df.select(vec![expr])?.logical_plan().clone();
 
@@ -1016,7 +1023,7 @@ mod tests {
         let _ = rule.rewrite(plan, &OptimizerContext::new())?;
         let inferred = rule.last_inferred();
 
-        assert_eq!(inferred.get("j:$.x").copied(), Some(JsonTypeSet::NUMERIC));
+        assert_eq!(inferred.get("j:$.x").copied(), Some(JsonTypeSet::INT64));
         Ok(())
     }
 
@@ -1025,8 +1032,8 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let a = datafusion::functions::expr_fn::get_field(col("j"), "a");
-        let b = datafusion::functions::expr_fn::get_field(col("j"), "b")
+        let a = get_field_typed(col("j"), "a", Some(lit(ScalarValue::Int64(None))));
+        let b = get_field_typed(col("j"), "b", Some(lit(ScalarValue::Int64(None))))
             .cast_to(&DataType::Int64, df.schema())?;
         let plan = df.filter(a.eq(b))?.logical_plan().clone();
 
@@ -1044,7 +1051,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let m = datafusion::functions::expr_fn::get_field(col("j"), "a");
+        let m = get_field_typed(col("j"), "a", None);
         let plan = df.select(vec![m])?.logical_plan().clone();
 
         let rule = JsonPathTypeInferenceRule::new();
@@ -1061,10 +1068,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let nested = datafusion::functions::expr_fn::get_field(
-            datafusion::functions::expr_fn::get_field(col("j"), "a"),
-            "b",
-        );
+        let nested = get_field_typed(get_field_typed(col("j"), "a", None), "b", None);
 
         let plan = df.select(vec![nested])?.logical_plan().clone();
 
@@ -1081,7 +1085,7 @@ mod tests {
         let ctx = ctx_with_table().await?;
         let df = ctx.table("t").await?;
 
-        let x = datafusion::functions::expr_fn::get_field(col("j"), "x");
+        let x = get_field_typed(col("j"), "x", None);
         let plan = df
             .filter(x.gt(lit(ScalarValue::Float64(Some(1.0)))))?
             .logical_plan()

@@ -1,4 +1,5 @@
 mod convert_writer;
+mod get_field_typed;
 mod json_display;
 mod json_path_type_inference;
 mod manifest;
