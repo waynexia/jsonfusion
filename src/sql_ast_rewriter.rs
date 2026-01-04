@@ -1,4 +1,5 @@
-use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue};
+use arrow::datatypes::Field;
+use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, TableReference};
 use datafusion_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion_expr::{Expr, GetFieldAccess};
 
@@ -16,9 +17,16 @@ impl JsonFusionExprPlanner {
     }
 
     fn is_jsonfusion_column(&self, schema: &DFSchema, column: &Column) -> bool {
-        ExprSchema::field_from_column(schema, column)
-            .ok()
-            .and_then(|field| field.metadata().get("JSONFUSION"))
+        let field = ExprSchema::field_from_column(schema, column)
+            .or_else(|_| schema.field_with_unqualified_name(&column.name))
+            .ok();
+        field.is_some_and(Self::is_jsonfusion_field)
+    }
+
+    fn is_jsonfusion_field(field: &Field) -> bool {
+        field
+            .metadata()
+            .get("JSONFUSION")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }
@@ -54,6 +62,22 @@ impl JsonFusionExprPlanner {
 }
 
 impl ExprPlanner for JsonFusionExprPlanner {
+    fn plan_compound_identifier(
+        &self,
+        field: &Field,
+        qualifier: Option<&TableReference>,
+        nested_names: &[String],
+    ) -> Result<PlannerResult<Vec<Expr>>> {
+        if !Self::is_jsonfusion_field(field) {
+            return Ok(PlannerResult::Original(Vec::new()));
+        }
+
+        let path = nested_names.join(".");
+        let column = Column::from((qualifier, field));
+        let rewritten = get_field_typed(Expr::Column(column), path, None);
+        Ok(PlannerResult::Planned(rewritten))
+    }
+
     fn plan_field_access(
         &self,
         expr: RawFieldAccessExpr,
@@ -203,5 +227,36 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result, PlannerResult::Original(_)));
+    }
+
+    #[test]
+    fn rewrites_compound_identifier_paths() {
+        let schema = jsonfusion_schema();
+        let planner = JsonFusionExprPlanner::new();
+        let field = schema.field_with_unqualified_name("data").unwrap();
+
+        let planned = planner
+            .plan_compound_identifier(field, None, &["a".to_string(), "b".to_string()])
+            .unwrap();
+
+        let expr = match planned {
+            PlannerResult::Planned(expr) => expr,
+            other => panic!("expected planned expression, got {other:?}"),
+        };
+
+        let Expr::ScalarFunction(fun) = expr else {
+            panic!("expected get_field_typed function, got {expr:?}");
+        };
+
+        assert_eq!(fun.name(), "get_field_typed");
+        assert_eq!(fun.args.len(), 2);
+
+        match &fun.args[1] {
+            Expr::Literal(ScalarValue::Utf8(Some(path)), _)
+            | Expr::Literal(ScalarValue::LargeUtf8(Some(path)), _) => {
+                assert_eq!(path, "a.b")
+            }
+            other => panic!("expected literal path, got {other:?}"),
+        }
     }
 }

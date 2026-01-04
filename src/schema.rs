@@ -24,6 +24,7 @@ impl JsonFusionTableSchema {
     }
 
     /// Get the corresponding Arrow schema
+    #[allow(dead_code)]
     pub fn arrow_schema(&self) -> &ArrowSchemaRef {
         &self.corresponding_arrow_schema
     }

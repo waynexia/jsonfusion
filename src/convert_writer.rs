@@ -41,6 +41,8 @@ pub struct ConvertWriterExec {
     given_schema: SchemaRef,
     /// Columns that contain JSON data (identified by JSONFUSION metadata)
     json_columns: Vec<String>,
+    /// Whether to expand JSON columns into structured types on write
+    expand_json: bool,
     /// Target file path for Parquet output
     output_path: std::path::PathBuf,
     /// Schema describing the structure of the output data.
@@ -65,6 +67,7 @@ impl ConvertWriterExec {
         input: Arc<dyn ExecutionPlan>,
         output_path: std::path::PathBuf,
         sort_order: Option<LexRequirement>,
+        expand_json: bool,
     ) -> Result<Self> {
         let input_schema = input.schema();
         let json_columns = Self::identify_json_columns_from_schema(&given_schema)?;
@@ -76,6 +79,7 @@ impl ConvertWriterExec {
             input_schema,
             given_schema,
             json_columns,
+            expand_json,
             output_path,
             count_schema,
             sort_order,
@@ -187,6 +191,7 @@ impl ExecutionPlan for ConvertWriterExec {
             Arc::clone(&children[0]),
             self.output_path.clone(),
             self.sort_order.clone(),
+            self.expand_json,
         )?))
     }
 
@@ -235,6 +240,7 @@ impl ExecutionPlan for ConvertWriterExec {
 
 impl ConvertWriterExec {
     /// Get the expanded schema after processing (used by ManifestUpdaterExec)
+    #[allow(dead_code)]
     pub fn get_expanded_schema(&self) -> Result<SchemaRef> {
         let expanded_lock = self.expanded_schema.read().map_err(|_| {
             datafusion_common::DataFusionError::Execution(
@@ -342,7 +348,11 @@ impl ConvertWriterExec {
             total_rows += batch.num_rows() as u64;
 
             // Process JSON columns if any
-            let processed_batch = Self::process_json_columns(&batch, json_columns)?;
+            let processed_batch = if self.expand_json {
+                Self::process_json_columns(&batch, json_columns)?
+            } else {
+                batch.clone()
+            };
 
             // Update unified schema - merge schemas from all processed batches
             match &unified_schema {
@@ -2118,7 +2128,7 @@ mod tests {
         let input_plan = mem_table.scan(&ctx.state(), None, &[], None).await?;
 
         let writer_exec =
-            ConvertWriterExec::new(schema.clone(), input_plan, output_path.clone(), None)?;
+            ConvertWriterExec::new(schema.clone(), input_plan, output_path.clone(), None, true)?;
 
         // Execute the writer
         let task_context = Arc::new(datafusion::execution::TaskContext::default());

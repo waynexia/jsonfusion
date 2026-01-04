@@ -102,7 +102,7 @@ impl ManifestInner {
         })
     }
 
-    /// Get merged Arrow schema from all files in manifest  
+    /// Get merged Arrow schema from all files in manifest
     pub fn get_merged_arrow_schema(&self) -> ArrowSchemaRef {
         // If no files in manifest, return empty schema
         if self.file_lists.is_empty() {
@@ -207,7 +207,7 @@ impl Manifest {
         })
     }
 
-    /// Get merged Arrow schema from all files in manifest  
+    /// Get merged Arrow schema from all files in manifest
     pub async fn get_merged_arrow_schema(&self) -> ArrowSchemaRef {
         let inner = self.inner.read().await;
         inner.get_merged_arrow_schema()
@@ -359,9 +359,9 @@ impl ExecutionPlan for ManifestUpdaterExec {
         // Create the manifest update logic
         let manifest = self.manifest.clone();
         let file_id = self.file_id;
-        let _given_schema = self.given_schema.clone();
-        let inner_plan = self.inner.clone();
+        let given_schema = self.given_schema.clone();
         let count_schema = self.inner.schema();
+        let inner = Arc::clone(&self.inner);
 
         let stream = futures::stream::once(async move {
             let mut inner_stream = inner_stream;
@@ -372,21 +372,15 @@ impl ExecutionPlan for ManifestUpdaterExec {
                     Ok(batch) => {
                         // Inner execution succeeded, now create FileMeta and update manifest
 
-                        // Try to get expanded schema from ConvertWriterExec
-                        let schema_to_use = if let Some(convert_writer) =
-                            inner_plan.as_any().downcast_ref::<ConvertWriterExec>()
-                        {
-                            // Use expanded schema if available, otherwise fall back to given schema
-                            convert_writer
-                                .get_expanded_schema()
-                                .expect("Expanded schema should be available")
-                        } else {
-                            panic!("ManifestUpdaterExec child must be ConvertWriterExec");
-                        };
+                        let expanded_schema = inner
+                            .as_any()
+                            .downcast_ref::<ConvertWriterExec>()
+                            .and_then(|exec| exec.get_expanded_schema().ok());
 
                         // Create JsonFusionTableSchema with the determined schema
-                        let json_fusion_schema =
-                            JsonFusionTableSchema::from_arrow_schema(schema_to_use);
+                        let json_fusion_schema = JsonFusionTableSchema::from_arrow_schema(
+                            expanded_schema.unwrap_or_else(|| given_schema.clone()),
+                        );
                         let file_meta = FileMeta::new(file_id, json_fusion_schema);
 
                         match manifest.add_files(vec![file_meta]).await {

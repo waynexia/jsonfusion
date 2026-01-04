@@ -20,7 +20,7 @@ pub fn json_display_udf() -> ScalarUDF {
             ColumnarValue::Scalar(scalar) => scalar.to_array()?,
         };
 
-        let json_strings = convert_array_to_json_strings(&array)?;
+        let json_strings = array_to_json_strings(&array)?;
 
         Ok(ColumnarValue::Array(json_strings))
     });
@@ -34,7 +34,7 @@ pub fn json_display_udf() -> ScalarUDF {
 }
 
 /// Convert an Arrow array to JSON string representations
-fn convert_array_to_json_strings(array: &ArrayRef) -> Result<ArrayRef> {
+pub(crate) fn array_to_json_strings(array: &ArrayRef) -> Result<ArrayRef> {
     let mut json_strings = Vec::with_capacity(array.len());
 
     for i in 0..array.len() {
@@ -243,7 +243,7 @@ mod tests {
         // Test boolean array
         let bool_array: ArrayRef =
             Arc::new(BooleanArray::from(vec![Some(true), Some(false), None]));
-        let json_strings = convert_array_to_json_strings(&bool_array)?;
+        let json_strings = array_to_json_strings(&bool_array)?;
         let string_array = json_strings.as_any().downcast_ref::<StringArray>().unwrap();
 
         assert_eq!(string_array.value(0), "true");
@@ -270,7 +270,7 @@ mod tests {
             ),
         ]));
 
-        let json_strings = convert_array_to_json_strings(&struct_array)?;
+        let json_strings = array_to_json_strings(&struct_array)?;
         let string_array = json_strings.as_any().downcast_ref::<StringArray>().unwrap();
 
         // First row: name is "Alice", age is 30
@@ -306,7 +306,7 @@ mod tests {
             ),
         ]));
 
-        let json_strings = convert_array_to_json_strings(&struct_array)?;
+        let json_strings = array_to_json_strings(&struct_array)?;
         let string_array = json_strings.as_any().downcast_ref::<StringArray>().unwrap();
 
         // Both rows should be null since all fields are null
@@ -338,7 +338,7 @@ mod tests {
         let field = Arc::new(Field::new("item", DataType::Int32, true));
         let list_array: ArrayRef = Arc::new(ListArray::new(field, offsets, values, None));
 
-        let json_strings = convert_array_to_json_strings(&list_array)?;
+        let json_strings = array_to_json_strings(&list_array)?;
         let string_array = json_strings.as_any().downcast_ref::<StringArray>().unwrap();
 
         // First list is empty - should be null

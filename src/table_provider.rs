@@ -28,16 +28,12 @@ pub struct JsonTableProvider {
     manifest: Manifest,
     /// The schema that the user provided on the table creation.
     given_schema: ArrowSchemaRef,
-    /// The schema with all expanded leaf nodes (only expanded JSON fields)
-    full_schema: ArrowSchemaRef,
     // showing schema depends on predicate?
 }
 
 impl JsonTableProvider {
     pub async fn create(base_dir: PathBuf, given_schema: ArrowSchemaRef) -> Result<Self> {
         let manifest = Manifest::create_or_load(base_dir.clone()).await?;
-        // todo: load full schema from manifest
-        let full_schema = given_schema.clone();
 
         let given_schema_json = serde_json::to_string(&given_schema)?;
         tokio::fs::write(base_dir.join("given_schema.json"), given_schema_json).await?;
@@ -46,7 +42,6 @@ impl JsonTableProvider {
             base_dir,
             manifest,
             given_schema,
-            full_schema,
         })
     }
 
@@ -56,13 +51,11 @@ impl JsonTableProvider {
         let given_schema: ArrowSchemaRef = serde_json::from_str(&given_schema_json)?;
 
         let manifest = Manifest::create_or_load(base_dir.clone()).await?;
-        let full_schema = manifest.get_merged_arrow_schema().await;
 
         Ok(Self {
             base_dir,
             manifest,
             given_schema,
-            full_schema,
         })
     }
 }
@@ -74,7 +67,7 @@ impl TableProvider for JsonTableProvider {
     }
 
     fn schema(&self) -> ArrowSchemaRef {
-        self.full_schema.clone()
+        self.given_schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -126,9 +119,12 @@ impl TableProvider for JsonTableProvider {
         let listing_options =
             ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension("parquet");
 
+        let merged_schema = self.manifest.get_merged_arrow_schema().await;
+        let scan_schema = build_scan_schema(&self.given_schema, &merged_schema);
+
         let config = ListingTableConfig::new_with_multi_paths(parquet_file_urls)
             .with_listing_options(listing_options)
-            .with_schema(self.schema());
+            .with_schema(scan_schema);
 
         let listing_table =
             ListingTable::try_new(config).map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -158,11 +154,16 @@ impl TableProvider for JsonTableProvider {
         let file_path = self.base_dir.join(format!("{file_id}.parquet"));
 
         // Create ConvertWriterExec to handle JSON processing and Parquet writing
-        let convert_writer =
-            ConvertWriterExec::new(self.given_schema.clone(), input, file_path.clone(), None)
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to create ConvertWriterExec: {e}"))
-                })?;
+        let convert_writer = ConvertWriterExec::new(
+            self.given_schema.clone(),
+            input,
+            file_path.clone(),
+            None,
+            true,
+        )
+        .map_err(|e| {
+            DataFusionError::Execution(format!("Failed to create ConvertWriterExec: {e}"))
+        })?;
 
         // Create a wrapper execution plan that updates the manifest after successful write
         // Pass file_id and given_schema - ManifestUpdaterExec will create FileMeta with expanded schema
@@ -175,6 +176,29 @@ impl TableProvider for JsonTableProvider {
 
         Ok(Arc::new(manifest_updater))
     }
+}
+
+fn build_scan_schema(
+    given_schema: &ArrowSchemaRef,
+    merged_schema: &ArrowSchemaRef,
+) -> ArrowSchemaRef {
+    let fields: Vec<Field> = given_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let merged_field = merged_schema.fields().find(field.name()).map(|f| f.1);
+            match merged_field {
+                Some(merged) => Field::new(
+                    field.name(),
+                    merged.data_type().clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(field.metadata().clone()),
+                None => field.as_ref().clone(),
+            }
+        })
+        .collect();
+    Arc::new(Schema::new(fields))
 }
 
 #[derive(Debug)]
