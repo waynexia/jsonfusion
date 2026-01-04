@@ -3,13 +3,13 @@ use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::types::NativeType;
-use datafusion_common::{Result, ScalarValue};
+use datafusion_common::{DFSchemaRef, Result, ScalarValue};
 use datafusion_expr::expr_rewriter::NamePreserver;
 use datafusion_expr::type_coercion::binary::{
     binary_numeric_coercion, decimal_coercion, string_coercion,
 };
 use datafusion_expr::type_coercion::functions::can_coerce_from;
-use datafusion_expr::{Cast, Expr, LogicalPlan, Signature, TypeSignature};
+use datafusion_expr::{Cast, Expr, ExprSchemable, LogicalPlan, Operator, Signature, TypeSignature};
 
 #[derive(Debug, Default)]
 pub struct GetFieldTypedTypeInferenceRule;
@@ -91,6 +91,31 @@ impl GetFieldTypedTypeInferenceRule {
             })
         })
     }
+
+    fn apply_comparison_strategy(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+        plan.transform_up_with_subqueries(|plan| {
+            let name_preserver = NamePreserver::new(&plan);
+            let schema = expr_schema_for_plan(&plan).clone();
+            plan.map_expressions(|expr| {
+                let saved = name_preserver.save(&expr);
+                let transformed = expr.transform_up(|expr| match expr {
+                    Expr::BinaryExpr(mut binary) if is_comparison_operator(binary.op) => {
+                        let (left, right, changed) =
+                            apply_comparison_hint(*binary.left, *binary.right, &schema)?;
+                        binary.left = Box::new(left);
+                        binary.right = Box::new(right);
+                        if changed {
+                            Ok(Transformed::yes(Expr::BinaryExpr(binary)))
+                        } else {
+                            Ok(Transformed::no(Expr::BinaryExpr(binary)))
+                        }
+                    }
+                    other => Ok(Transformed::no(other)),
+                })?;
+                Ok(transformed.update_data(|expr| saved.restore(expr)))
+            })
+        })
+    }
 }
 
 impl AnalyzerRule for GetFieldTypedTypeInferenceRule {
@@ -101,6 +126,7 @@ impl AnalyzerRule for GetFieldTypedTypeInferenceRule {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         let transformed = Self::apply_cast_strategy(plan)?;
         let transformed = Self::apply_signature_strategy(transformed.data)?;
+        let transformed = Self::apply_comparison_strategy(transformed.data)?;
         Ok(transformed.data)
     }
 }
@@ -154,6 +180,91 @@ fn add_signature_hints(signature: &Signature, args: Vec<Expr>) -> Result<(Vec<Ex
         updated_args.push(updated);
     }
     Ok((updated_args, changed))
+}
+
+fn expr_schema_for_plan(plan: &LogicalPlan) -> &DFSchemaRef {
+    let inputs = plan.inputs();
+    match inputs.as_slice() {
+        [input] => input.schema(),
+        _ => plan.schema(),
+    }
+}
+
+fn is_comparison_operator(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    )
+}
+
+fn apply_comparison_hint(
+    left: Expr,
+    right: Expr,
+    schema: &DFSchemaRef,
+) -> Result<(Expr, Expr, bool)> {
+    let left_unknown = is_top_level_unknown_get_field_typed(&left);
+    let right_unknown = is_top_level_unknown_get_field_typed(&right);
+
+    if left_unknown == right_unknown {
+        return Ok((left, right, false));
+    }
+
+    if left_unknown {
+        if contains_unknown_get_field_typed(&right)? {
+            return Ok((left, right, false));
+        }
+        if let Some(hint_type) = comparison_hint_type(&right, schema) {
+            let (left, changed) = add_type_hint(left, &hint_type)?;
+            return Ok((left, right, changed));
+        }
+    } else if right_unknown {
+        if contains_unknown_get_field_typed(&left)? {
+            return Ok((left, right, false));
+        }
+        if let Some(hint_type) = comparison_hint_type(&left, schema) {
+            let (right, changed) = add_type_hint(right, &hint_type)?;
+            return Ok((left, right, changed));
+        }
+    }
+
+    Ok((left, right, false))
+}
+
+fn is_top_level_unknown_get_field_typed(expr: &Expr) -> bool {
+    is_unknown_get_field_typed(unwrap_alias_expr(expr))
+}
+
+fn contains_unknown_get_field_typed(expr: &Expr) -> Result<bool> {
+    expr.exists(|expr| Ok(is_unknown_get_field_typed(expr)))
+}
+
+fn is_unknown_get_field_typed(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::ScalarFunction(fun)
+            if fun.name() == "get_field_typed" && fun.args.len() == 2
+    )
+}
+
+fn comparison_hint_type(expr: &Expr, schema: &DFSchemaRef) -> Option<DataType> {
+    let data_type = expr.get_type(schema.as_ref()).ok()?;
+    if matches!(data_type, DataType::Null) {
+        None
+    } else {
+        Some(data_type)
+    }
+}
+
+fn unwrap_alias_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Alias(alias) => unwrap_alias_expr(alias.expr.as_ref()),
+        other => other,
+    }
 }
 
 fn candidate_types_for_signature(
@@ -409,6 +520,29 @@ mod tests {
         &fun.args[0]
     }
 
+    fn get_binary_expr(plan: &LogicalPlan) -> &datafusion_expr::expr::BinaryExpr {
+        let LogicalPlan::Projection(p) = plan else {
+            panic!("expected projection, got {plan:?}");
+        };
+        let expr = unwrap_alias(&p.expr[0]);
+        let Expr::BinaryExpr(binary) = expr else {
+            panic!("expected binary expression, got {expr:?}");
+        };
+        binary
+    }
+
+    fn projection_plan(input: LogicalPlan, expr: Expr) -> datafusion_common::Result<LogicalPlan> {
+        let schema = Arc::new(DFSchema::from_unqualified_fields(
+            vec![Field::new("cmp", DataType::Boolean, true)].into(),
+            HashMap::new(),
+        )?);
+        Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
+            vec![expr],
+            Arc::new(input),
+            schema,
+        )?))
+    }
+
     #[tokio::test]
     async fn test_cast_sets_get_field_typed_type_hint() -> datafusion_common::Result<()> {
         let ctx = ctx_with_table().await?;
@@ -476,6 +610,71 @@ mod tests {
             other => panic!("unexpected type hint expr: {other:?}"),
         };
         assert_eq!(hint_type, DataType::Utf8View);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_comparison_sets_get_field_typed_type_hint() -> datafusion_common::Result<()> {
+        let ctx = ctx_with_table().await?;
+        let df = ctx.table("t").await?;
+
+        let expr = get_field_typed(col("j"), "a", None)
+            .eq(Expr::Literal(ScalarValue::Int64(Some(1)), None));
+        let plan = projection_plan(df.logical_plan().clone(), expr)?;
+
+        let rule = GetFieldTypedTypeInferenceRule::new();
+        let analyzed = rule.analyze(plan, &ConfigOptions::new())?;
+
+        let binary = get_binary_expr(&analyzed);
+        let args = get_field_typed_args(binary.left.as_ref());
+
+        assert_eq!(args.len(), 3);
+        let hint_type = match &args[2] {
+            Expr::Literal(value, _) => value.data_type(),
+            Expr::Cast(cast) => cast.data_type.clone(),
+            other => panic!("unexpected type hint expr: {other:?}"),
+        };
+        assert_eq!(hint_type, DataType::Int64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_comparison_skips_when_both_unknown() -> datafusion_common::Result<()> {
+        let ctx = ctx_with_table().await?;
+        let df = ctx.table("t").await?;
+
+        let expr = get_field_typed(col("j"), "a", None).eq(get_field_typed(col("j"), "b", None));
+        let plan = projection_plan(df.logical_plan().clone(), expr)?;
+
+        let rule = GetFieldTypedTypeInferenceRule::new();
+        let analyzed = rule.analyze(plan, &ConfigOptions::new())?;
+
+        let binary = get_binary_expr(&analyzed);
+        let left_args = get_field_typed_args(binary.left.as_ref());
+        let right_args = get_field_typed_args(binary.right.as_ref());
+
+        assert_eq!(left_args.len(), 2);
+        assert_eq!(right_args.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_comparison_skips_when_other_side_contains_unknown()
+    -> datafusion_common::Result<()> {
+        let ctx = ctx_with_table().await?;
+        let df = ctx.table("t").await?;
+
+        let right = Expr::IsNull(Box::new(get_field_typed(col("j"), "b", None)));
+        let expr = get_field_typed(col("j"), "a", None).eq(right);
+        let plan = projection_plan(df.logical_plan().clone(), expr)?;
+
+        let rule = GetFieldTypedTypeInferenceRule::new();
+        let analyzed = rule.analyze(plan, &ConfigOptions::new())?;
+
+        let binary = get_binary_expr(&analyzed);
+        let left_args = get_field_typed_args(binary.left.as_ref());
+
+        assert_eq!(left_args.len(), 2);
         Ok(())
     }
 }
