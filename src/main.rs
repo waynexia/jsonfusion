@@ -2,7 +2,6 @@ mod convert_writer;
 mod get_field_typed;
 mod get_field_typed_type_inference;
 mod json_display;
-mod json_path_type_inference;
 mod manifest;
 mod schema;
 mod sql_ast_rewriter;
@@ -78,10 +77,6 @@ async fn main() -> Result<(), std::io::Error> {
             Arc::new(ResolveGroupingFunction::new()),
             Arc::new(TypeCoercion::new()),
         ])
-        // run at the very end to print inferred JSON path type sets
-        .with_optimizer_rule(Arc::new(
-            json_path_type_inference::JsonPathTypeInferenceRule::new(),
-        ))
         .build();
 
     // Create a SessionContext
