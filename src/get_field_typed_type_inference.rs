@@ -3,17 +3,21 @@ use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::types::NativeType;
+use datafusion_common::utils::ListCoercion;
 use datafusion_common::{Column, DFSchemaRef, ExprSchema, Result, ScalarValue};
 use datafusion_expr::expr_rewriter::NamePreserver;
 use datafusion_expr::type_coercion::binary::{
     BinaryTypeCoercer, binary_numeric_coercion, comparison_coercion, decimal_coercion,
-    like_coercion, string_coercion,
+    like_coercion, string_coercion, type_union_resolution,
 };
 use datafusion_expr::type_coercion::functions::can_coerce_from;
 use datafusion_expr::type_coercion::other::{
     get_coerce_type_for_case_expression, get_coerce_type_for_list,
 };
-use datafusion_expr::{Cast, Expr, ExprSchemable, LogicalPlan, Operator, Signature, TypeSignature};
+use datafusion_expr::{
+    ArrayFunctionArgument, ArrayFunctionSignature, Cast, Expr, ExprSchemable, LogicalPlan,
+    Operator, Signature, TypeSignature,
+};
 
 use crate::get_field_typed::get_field_typed;
 
@@ -59,11 +63,13 @@ impl GetFieldTypedTypeInferenceRule {
     fn apply_signature_strategy(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         plan.transform_up_with_subqueries(|plan| {
             let name_preserver = NamePreserver::new(&plan);
+            let schema = expr_schema_for_plan(&plan).clone();
             plan.map_expressions(|expr| {
                 let saved = name_preserver.save(&expr);
                 let transformed = expr.transform_up(|expr| match expr {
                     Expr::ScalarFunction(mut fun) => {
-                        let (args, changed) = add_signature_hints(fun.func.signature(), fun.args)?;
+                        let (args, changed) =
+                            add_signature_hints(fun.func.signature(), fun.args, &schema)?;
                         fun.args = args;
                         if changed {
                             Ok(Transformed::yes(Expr::ScalarFunction(fun)))
@@ -73,7 +79,7 @@ impl GetFieldTypedTypeInferenceRule {
                     }
                     Expr::AggregateFunction(mut fun) => {
                         let (args, changed) =
-                            add_signature_hints(fun.func.signature(), fun.params.args)?;
+                            add_signature_hints(fun.func.signature(), fun.params.args, &schema)?;
                         fun.params.args = args;
                         if changed {
                             Ok(Transformed::yes(Expr::AggregateFunction(fun)))
@@ -83,7 +89,8 @@ impl GetFieldTypedTypeInferenceRule {
                     }
                     Expr::WindowFunction(mut fun) => {
                         let signature = fun.fun.signature();
-                        let (args, changed) = add_signature_hints(&signature, fun.params.args)?;
+                        let (args, changed) =
+                            add_signature_hints(&signature, fun.params.args, &schema)?;
                         fun.params.args = args;
                         if changed {
                             Ok(Transformed::yes(Expr::WindowFunction(fun)))
@@ -308,9 +315,18 @@ fn type_hint_expr(data_type: &DataType) -> Expr {
     }
 }
 
-fn add_signature_hints(signature: &Signature, args: Vec<Expr>) -> Result<(Vec<Expr>, bool)> {
+fn add_signature_hints(
+    signature: &Signature,
+    args: Vec<Expr>,
+    schema: &DFSchemaRef,
+) -> Result<(Vec<Expr>, bool)> {
     let Some(candidates) = candidate_types_for_signature(&signature.type_signature, args.len())
     else {
+        if let Some(array_signature) =
+            array_signature_for_args(&signature.type_signature, args.len())
+        {
+            return add_array_signature_hints(array_signature, args, schema);
+        }
         return Ok((args, false));
     };
     let mut changed = false;
@@ -333,11 +349,164 @@ fn add_signature_hints(signature: &Signature, args: Vec<Expr>) -> Result<(Vec<Ex
     Ok((updated_args, changed))
 }
 
+fn add_array_signature_hints(
+    signature: &ArrayFunctionSignature,
+    args: Vec<Expr>,
+    schema: &DFSchemaRef,
+) -> Result<(Vec<Expr>, bool)> {
+    let ArrayFunctionSignature::Array {
+        arguments,
+        array_coercion,
+    } = signature
+    else {
+        return Ok((args, false));
+    };
+
+    if args.len() != arguments.len() {
+        return Ok((args, false));
+    }
+
+    let mut has_unknown = false;
+    let mut element_types = Vec::new();
+    let mut nested_item_nullability = Vec::with_capacity(args.len());
+    let mut large_list = false;
+    let mut fixed_size = array_coercion.as_ref() != Some(&ListCoercion::FixedSizedListToList);
+    let mut list_sizes = Vec::new();
+
+    for (arg, argument) in args.iter().zip(arguments.iter()) {
+        let is_unknown = is_top_level_unknown_get_field_typed(arg);
+        has_unknown |= is_unknown;
+        if has_nested_unknown(arg, is_unknown)? {
+            return Ok((args, false));
+        }
+
+        let arg_type = if is_unknown {
+            DataType::Null
+        } else {
+            let Ok(data_type) = arg.get_type(schema.as_ref()) else {
+                return Ok((args, false));
+            };
+            data_type
+        };
+        match argument {
+            ArrayFunctionArgument::Array => match &arg_type {
+                DataType::Null => {
+                    element_types.push(DataType::Null);
+                    nested_item_nullability.push(None);
+                }
+                DataType::List(field) => {
+                    element_types.push(field.data_type().clone());
+                    nested_item_nullability.push(Some(field.is_nullable()));
+                    fixed_size = false;
+                }
+                DataType::LargeList(field) => {
+                    element_types.push(field.data_type().clone());
+                    nested_item_nullability.push(Some(field.is_nullable()));
+                    large_list = true;
+                    fixed_size = false;
+                }
+                DataType::FixedSizeList(field, size) => {
+                    element_types.push(field.data_type().clone());
+                    nested_item_nullability.push(Some(field.is_nullable()));
+                    list_sizes.push(*size);
+                }
+                _ => {
+                    return Ok((args, false));
+                }
+            },
+            ArrayFunctionArgument::Element => {
+                element_types.push(arg_type.clone());
+                nested_item_nullability.push(None);
+            }
+            ArrayFunctionArgument::Index | ArrayFunctionArgument::String => {
+                nested_item_nullability.push(None);
+            }
+        }
+    }
+
+    if !has_unknown {
+        return Ok((args, false));
+    }
+
+    if element_types
+        .iter()
+        .all(|element_type| matches!(element_type, DataType::Null))
+    {
+        return Ok((args, false));
+    }
+    let Some(element_type) = type_union_resolution(&element_types) else {
+        return Ok((args, false));
+    };
+    if matches!(element_type, DataType::Null) {
+        return Ok((args, false));
+    }
+
+    if !fixed_size {
+        list_sizes.clear();
+    }
+    let mut list_sizes = list_sizes.into_iter();
+
+    let mut changed = false;
+    let mut updated_args = Vec::with_capacity(args.len());
+    for (idx, (arg, argument)) in args.into_iter().zip(arguments.iter()).enumerate() {
+        let hint_type = match argument {
+            ArrayFunctionArgument::Index => DataType::Int64,
+            ArrayFunctionArgument::String => DataType::Utf8,
+            ArrayFunctionArgument::Element => element_type.clone(),
+            ArrayFunctionArgument::Array => {
+                let nested_nullable = nested_item_nullability[idx].unwrap_or(true);
+                if large_list {
+                    DataType::new_large_list(element_type.clone(), nested_nullable)
+                } else if let Some(size) = list_sizes.next() {
+                    DataType::new_fixed_size_list(element_type.clone(), size, nested_nullable)
+                } else {
+                    DataType::new_list(element_type.clone(), nested_nullable)
+                }
+            }
+        };
+        let (updated, did_change) = add_type_hint(arg, &hint_type)?;
+        if did_change {
+            changed = true;
+        }
+        updated_args.push(updated);
+    }
+
+    Ok((updated_args, changed))
+}
+
 fn expr_schema_for_plan(plan: &LogicalPlan) -> &DFSchemaRef {
     let inputs = plan.inputs();
     match inputs.as_slice() {
         [input] => input.schema(),
         _ => plan.schema(),
+    }
+}
+
+fn array_signature_for_args(
+    signature: &TypeSignature,
+    arg_count: usize,
+) -> Option<&ArrayFunctionSignature> {
+    match signature {
+        TypeSignature::ArraySignature(array_signature) => match array_signature {
+            ArrayFunctionSignature::Array { arguments, .. } => {
+                if arguments.len() == arg_count {
+                    Some(array_signature)
+                } else {
+                    None
+                }
+            }
+            ArrayFunctionSignature::RecursiveArray | ArrayFunctionSignature::MapArray => {
+                if arg_count == 1 {
+                    Some(array_signature)
+                } else {
+                    None
+                }
+            }
+        },
+        TypeSignature::OneOf(signatures) => signatures
+            .iter()
+            .find_map(|signature| array_signature_for_args(signature, arg_count)),
+        _ => None,
     }
 }
 
@@ -1131,6 +1300,13 @@ mod tests {
         }
     }
 
+    fn assert_list_inner_type(data_type: &DataType, expected: &DataType) {
+        let DataType::List(field) = data_type else {
+            panic!("expected list type, got {data_type:?}");
+        };
+        assert_eq!(field.data_type(), expected);
+    }
+
     fn projection_plan_with_type(
         input: LogicalPlan,
         expr: Expr,
@@ -1218,6 +1394,93 @@ mod tests {
             other => panic!("unexpected type hint expr: {other:?}"),
         };
         assert_eq!(hint_type, DataType::Utf8View);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_array_signature_sets_get_field_typed_list_hint() -> datafusion_common::Result<()>
+    {
+        let ctx = ctx_with_table().await?;
+        let df = ctx.table("t").await?;
+
+        let udf = Arc::new(ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+            "array_has_like",
+            Signature::array_and_element(Volatility::Immutable),
+            DataType::Boolean,
+            Arc::new(|_args: &[ColumnarValue]| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None)))
+            }),
+        )));
+
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            udf,
+            vec![
+                get_field_typed(col("j"), "a", None),
+                Expr::Literal(ScalarValue::Utf8(Some("hiking".to_string())), None),
+            ],
+        ));
+        let input = df.logical_plan().clone();
+        let schema = Arc::new(DFSchema::from_unqualified_fields(
+            vec![Field::new("array_has_like", DataType::Boolean, true)].into(),
+            HashMap::new(),
+        )?);
+        let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
+            vec![expr],
+            Arc::new(input),
+            schema,
+        )?);
+
+        let rule = GetFieldTypedTypeInferenceRule::new();
+        let analyzed = rule.analyze(plan, &ConfigOptions::new())?;
+
+        let arg = get_first_scalar_arg(&analyzed);
+        let args = get_field_typed_args(arg);
+
+        assert_eq!(args.len(), 3);
+        assert_list_inner_type(&hint_data_type(args), &DataType::Utf8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_array_signature_one_of_sets_get_field_typed_list_hint()
+    -> datafusion_common::Result<()> {
+        let ctx = ctx_with_table().await?;
+        let df = ctx.table("t").await?;
+
+        let udf = Arc::new(ScalarUDF::from(SimpleScalarUDF::new_with_signature(
+            "array_find_like",
+            Signature::array_and_element_and_optional_index(Volatility::Immutable),
+            DataType::Int64,
+            Arc::new(|_args: &[ColumnarValue]| Ok(ColumnarValue::Scalar(ScalarValue::Int64(None)))),
+        )));
+
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            udf,
+            vec![
+                get_field_typed(col("j"), "a", None),
+                Expr::Literal(ScalarValue::Utf8(Some("hiking".to_string())), None),
+                Expr::Literal(ScalarValue::Int64(Some(1)), None),
+            ],
+        ));
+        let input = df.logical_plan().clone();
+        let schema = Arc::new(DFSchema::from_unqualified_fields(
+            vec![Field::new("array_find_like", DataType::Int64, true)].into(),
+            HashMap::new(),
+        )?);
+        let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
+            vec![expr],
+            Arc::new(input),
+            schema,
+        )?);
+
+        let rule = GetFieldTypedTypeInferenceRule::new();
+        let analyzed = rule.analyze(plan, &ConfigOptions::new())?;
+
+        let arg = get_first_scalar_arg(&analyzed);
+        let args = get_field_typed_args(arg);
+
+        assert_eq!(args.len(), 3);
+        assert_list_inner_type(&hint_data_type(args), &DataType::Utf8);
         Ok(())
     }
 
