@@ -59,6 +59,20 @@ pub(crate) fn array_to_json_strings(array: &ArrayRef) -> Result<ArrayRef> {
     Ok(Arc::new(string_array))
 }
 
+pub(crate) fn array_value_to_json_string(array: &ArrayRef, index: usize) -> Result<Option<String>> {
+    if array.is_null(index) {
+        return Ok(None);
+    }
+
+    let json_value = convert_array_value_to_json(array, index)?;
+    if is_empty_value(&json_value) {
+        return Ok(None);
+    }
+    let json_string = serde_json::to_string(&json_value)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to serialize JSON: {e}")))?;
+    Ok(Some(json_string))
+}
+
 /// Convert a single array value at the given index to a JSON Value
 fn convert_array_value_to_json(array: &ArrayRef, index: usize) -> Result<Value> {
     use arrow::array::*;

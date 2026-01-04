@@ -1,9 +1,9 @@
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::types::NativeType;
-use datafusion_common::{DFSchemaRef, Result, ScalarValue};
+use datafusion_common::{Column, DFSchemaRef, ExprSchema, Result, ScalarValue};
 use datafusion_expr::expr_rewriter::NamePreserver;
 use datafusion_expr::type_coercion::binary::{
     BinaryTypeCoercer, binary_numeric_coercion, comparison_coercion, decimal_coercion,
@@ -14,6 +14,8 @@ use datafusion_expr::type_coercion::other::{
     get_coerce_type_for_case_expression, get_coerce_type_for_list,
 };
 use datafusion_expr::{Cast, Expr, ExprSchemable, LogicalPlan, Operator, Signature, TypeSignature};
+
+use crate::get_field_typed::get_field_typed;
 
 #[derive(Debug, Default)]
 pub struct GetFieldTypedTypeInferenceRule;
@@ -224,10 +226,59 @@ impl AnalyzerRule for GetFieldTypedTypeInferenceRule {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        let transformed = Self::apply_cast_strategy(plan)?;
+        let transformed = Self::apply_column_strategy(plan)?;
+        let transformed = Self::apply_cast_strategy(transformed.data)?;
         let transformed = Self::apply_signature_strategy(transformed.data)?;
         let transformed = Self::apply_type_coercion_strategy(transformed.data)?;
         Ok(transformed.data)
+    }
+}
+
+fn is_jsonfusion_field(field: &Field) -> bool {
+    field
+        .metadata()
+        .get("JSONFUSION")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn is_jsonfusion_column(schema: &DFSchemaRef, column: &Column) -> bool {
+    let field = ExprSchema::field_from_column(schema.as_ref(), column)
+        .or_else(|_| schema.field_with_unqualified_name(&column.name))
+        .ok();
+    field.is_some_and(is_jsonfusion_field)
+}
+
+fn wrap_jsonfusion_column(expr: Expr, schema: &DFSchemaRef) -> Result<(Expr, bool)> {
+    match expr {
+        Expr::Column(column) if is_jsonfusion_column(schema, &column) => {
+            Ok((get_field_typed(Expr::Column(column), "", None), true))
+        }
+        Expr::Alias(mut alias) => {
+            let (inner, changed) = wrap_jsonfusion_column(*alias.expr, schema)?;
+            alias.expr = Box::new(inner);
+            Ok((Expr::Alias(alias), changed))
+        }
+        other => Ok((other, false)),
+    }
+}
+
+impl GetFieldTypedTypeInferenceRule {
+    fn apply_column_strategy(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+        plan.transform_up_with_subqueries(|plan| {
+            let name_preserver = NamePreserver::new(&plan);
+            let schema = expr_schema_for_plan(&plan).clone();
+            plan.map_expressions(|expr| {
+                let saved = name_preserver.save(&expr);
+                let (expr, changed) = wrap_jsonfusion_column(expr, &schema)?;
+                let transformed = if changed {
+                    Transformed::yes(expr)
+                } else {
+                    Transformed::no(expr)
+                };
+                Ok(transformed.update_data(|expr| saved.restore(expr)))
+            })
+        })
     }
 }
 

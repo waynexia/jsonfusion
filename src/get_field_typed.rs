@@ -20,6 +20,8 @@ use datafusion_expr::{
 use simd_json::OwnedValue;
 use simd_json::prelude::*;
 
+use crate::json_display::array_value_to_json_string;
+
 static GET_FIELD_TYPED: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     let inner = core::get_field();
     Arc::new(ScalarUDF::new_from_impl(GetFieldTypedUdfImpl::new(
@@ -68,7 +70,7 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match arg_types.len() {
-            2 => Ok(DataType::Binary),
+            2 => Ok(DataType::Utf8),
             3 => Ok(arg_types[2].clone()),
             other => internal_err!("get_field_typed expects 2 or 3 args, got {other}"),
         }
@@ -76,7 +78,7 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
 
     fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
         let data_type = match args.arg_fields.len() {
-            2 => DataType::Binary,
+            2 => DataType::Utf8,
             3 => args.arg_fields[2].data_type().clone(),
             other => {
                 return internal_err!("get_field_typed expects 2 or 3 args, got {other}");
@@ -94,6 +96,7 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
         };
         let target_type = args.return_type();
         let null_scalar = null_scalar_for_type(target_type);
+        let json_default = args.args.len() == 2;
 
         match &args.args[0] {
             ColumnarValue::Array(array) => {
@@ -109,6 +112,7 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
                         &segments,
                         target_type,
                         &null_scalar,
+                        json_default,
                     )?;
                     scalars.push(scalar);
                 }
@@ -117,8 +121,14 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
             }
             ColumnarValue::Scalar(scalar) => {
                 let array = scalar.to_array()?;
-                let scalar =
-                    scalar_from_array_value(&array, 0, &segments, target_type, &null_scalar)?;
+                let scalar = scalar_from_array_value(
+                    &array,
+                    0,
+                    &segments,
+                    target_type,
+                    &null_scalar,
+                    json_default,
+                )?;
                 Ok(ColumnarValue::Scalar(scalar))
             }
         }
@@ -256,7 +266,12 @@ fn scalar_from_array_value(
     segments: &[&str],
     target_type: &DataType,
     null_scalar: &ScalarValue,
+    json_default: bool,
 ) -> Result<ScalarValue> {
+    if json_default {
+        return json_scalar_from_array_value(array, index, segments, null_scalar);
+    }
+
     if array.is_null(index) {
         return Ok(null_scalar.clone());
     }
@@ -292,6 +307,156 @@ fn scalar_from_array_value(
             null_scalar,
         )),
         _ => Ok(null_scalar.clone()),
+    }
+}
+
+fn json_scalar_from_array_value(
+    array: &ArrayRef,
+    index: usize,
+    segments: &[&str],
+    null_scalar: &ScalarValue,
+) -> Result<ScalarValue> {
+    if array.is_null(index) {
+        return Ok(null_scalar.clone());
+    }
+
+    match array.data_type() {
+        DataType::Struct(_) => {
+            let json_string = json_string_from_struct_array(array, index, segments)?;
+            Ok(json_scalar_from_json_string(json_string, null_scalar))
+        }
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary => {
+            let Some(raw) = json_string_from_array(array, index)? else {
+                return Ok(null_scalar.clone());
+            };
+
+            if segments.is_empty() {
+                let raw_trimmed = raw.trim();
+                if raw_trimmed.is_empty() {
+                    return Ok(null_scalar.clone());
+                }
+                let mut bytes = raw_trimmed.as_bytes().to_vec();
+                if let Ok(value) = simd_json::from_slice::<OwnedValue>(&mut bytes) {
+                    let json_string = json_string_from_owned_value(&value);
+                    if let Some(json_string) = json_string {
+                        return Ok(ScalarValue::Utf8(Some(json_string)));
+                    }
+                    return Ok(null_scalar.clone());
+                }
+
+                let json_string = json_string_from_raw_value(&raw);
+                Ok(json_scalar_from_json_string(json_string, null_scalar))
+            } else {
+                let json_string = json_string_from_json_str(&raw, segments)?;
+                Ok(json_scalar_from_json_string(json_string, null_scalar))
+            }
+        }
+        _ if segments.is_empty() => {
+            let json_string = array_value_to_json_string(array, index)?;
+            Ok(json_scalar_from_json_string(json_string, null_scalar))
+        }
+        _ => Ok(null_scalar.clone()),
+    }
+}
+
+fn json_scalar_from_json_string(
+    json_string: Option<String>,
+    null_scalar: &ScalarValue,
+) -> ScalarValue {
+    match json_string {
+        Some(value) => ScalarValue::Utf8(Some(value)),
+        None => null_scalar.clone(),
+    }
+}
+
+fn json_string_from_struct_array(
+    array: &ArrayRef,
+    index: usize,
+    segments: &[&str],
+) -> Result<Option<String>> {
+    let mut current_array = Arc::clone(array);
+    let mut remaining = segments;
+
+    while let Some((head, tail)) = remaining.split_first() {
+        let Some(struct_array) = current_array.as_any().downcast_ref::<StructArray>() else {
+            return Ok(None);
+        };
+        if struct_array.is_null(index) {
+            return Ok(None);
+        }
+
+        let DataType::Struct(fields) = current_array.data_type() else {
+            return Ok(None);
+        };
+        let Some((field_index, _)) = fields.iter().enumerate().find(|(_, f)| f.name() == *head)
+        else {
+            return Ok(None);
+        };
+
+        current_array = struct_array.column(field_index).clone();
+        remaining = tail;
+    }
+
+    let json_string = match current_array.data_type() {
+        DataType::Binary | DataType::LargeBinary => {
+            let Some(raw) = json_string_from_array(&current_array, index)? else {
+                return Ok(None);
+            };
+            json_string_from_raw_value(&raw)
+        }
+        _ => array_value_to_json_string(&current_array, index)?,
+    };
+    Ok(json_string)
+}
+
+fn json_string_from_raw_value(value: &str) -> Option<String> {
+    serde_json::to_string(value).ok()
+}
+
+fn json_string_from_json_str(json_str: &str, segments: &[&str]) -> Result<Option<String>> {
+    let json_str = json_str.trim();
+    if json_str.is_empty() {
+        return Ok(None);
+    }
+
+    let mut bytes = json_str.as_bytes().to_vec();
+    let Ok(value) = simd_json::from_slice::<OwnedValue>(&mut bytes) else {
+        return Ok(None);
+    };
+
+    let extracted = if segments.is_empty() {
+        Some(&value)
+    } else {
+        extract_json_path(&value, segments)
+    };
+
+    Ok(extracted.and_then(json_string_from_owned_value))
+}
+
+fn json_string_from_owned_value(value: &OwnedValue) -> Option<String> {
+    match value.value_type() {
+        simd_json::ValueType::Null => None,
+        simd_json::ValueType::Array => {
+            let arr = value.as_array()?;
+            if arr.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        }
+        simd_json::ValueType::Object => {
+            let obj = value.as_object()?;
+            if obj.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        }
+        _ => Some(value.to_string()),
     }
 }
 
@@ -544,8 +709,30 @@ mod tests {
         }
     }
 
+    fn build_unknown_args(input: ColumnarValue, path: &str) -> ScalarFunctionArgs {
+        let path_value = ColumnarValue::Scalar(ScalarValue::Utf8(Some(path.to_string())));
+        let args = vec![input, path_value];
+        let arg_fields = args
+            .iter()
+            .enumerate()
+            .map(|(idx, arg)| Arc::new(Field::new(format!("arg_{idx}"), arg.data_type(), true)))
+            .collect();
+        let number_rows = match &args[0] {
+            ColumnarValue::Array(array) => array.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+        let return_field = Arc::new(Field::new("get_field_typed", DataType::Utf8, true));
+        ScalarFunctionArgs {
+            args,
+            arg_fields,
+            number_rows,
+            return_field,
+            config_options: Arc::new(ConfigOptions::new()),
+        }
+    }
+
     #[test]
-    fn test_return_type_defaults_to_binary() -> Result<()> {
+    fn test_return_type_defaults_to_utf8() -> Result<()> {
         let arg_fields = vec![
             Arc::new(Field::new("base", DataType::Utf8, true)),
             Arc::new(Field::new("field", DataType::Utf8, false)),
@@ -558,7 +745,7 @@ mod tests {
         };
 
         let field = GET_FIELD_TYPED.inner().return_field_from_args(args)?;
-        assert_eq!(field.data_type(), &DataType::Binary);
+        assert_eq!(field.data_type(), &DataType::Utf8);
         Ok(())
     }
 
@@ -631,6 +818,30 @@ mod tests {
         };
         let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(string_array.value(0), "alice@example.com");
+        assert!(string_array.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_invocation_defaults_to_json_string() -> Result<()> {
+        let email_array: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("alice@example.com"), None]));
+        let struct_array: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("email", DataType::Utf8, true)),
+            email_array,
+        )]));
+
+        let args = build_unknown_args(ColumnarValue::Array(struct_array), "email");
+        let value = GET_FIELD_TYPED.inner().invoke_with_args(args)?;
+        let ColumnarValue::Array(array) = value else {
+            panic!("expected array result");
+        };
+        let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(string_array.value(0)).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::Value::String("alice@example.com".to_string())
+        );
         assert!(string_array.is_null(1));
         Ok(())
     }
