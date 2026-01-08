@@ -6,9 +6,12 @@ use std::fmt;
 use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
 
+use arrow::array::builder::make_builder;
 use arrow::array::{
-    Array, ArrayBuilder, ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, ListBuilder,
-    NullArray, RecordBatch, StringBuilder, StructArray, StructBuilder, UInt64Array, UInt64Builder,
+    Array, ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder,
+    Int16Builder, Int32Builder, Int64Builder, ListBuilder, NullArray, RecordBatch, StringBuilder,
+    StructArray, StructBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Array,
+    UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::TaskContext;
@@ -28,6 +31,11 @@ use parquet::file::properties::WriterProperties;
 use simd_json::OwnedValue;
 use simd_json::prelude::*;
 
+use crate::get_field_typed::scalar_from_json_value;
+use crate::jsonfusion_hints::{
+    JSONFUSION_HINTS_KEY, JSONFUSION_METADATA_KEY, JsonFusionPathHint, apply_hint_to_type,
+    decode_jsonfusion_hints, specs_to_hints,
+};
 /// Execution plan for writing record batches with JSON processing and Parquet output.
 ///
 /// Returns a single row with the number of values written
@@ -41,6 +49,8 @@ pub struct ConvertWriterExec {
     given_schema: SchemaRef,
     /// Columns that contain JSON data (identified by JSONFUSION metadata)
     json_columns: Vec<String>,
+    /// Column-level JSON path hints for JSONFUSION columns
+    json_hints: HashMap<String, Vec<JsonFusionPathHint>>,
     /// Whether to expand JSON columns into structured types on write
     expand_json: bool,
     /// Target file path for Parquet output
@@ -71,6 +81,7 @@ impl ConvertWriterExec {
     ) -> Result<Self> {
         let input_schema = input.schema();
         let json_columns = Self::identify_json_columns_from_schema(&given_schema)?;
+        let json_hints = Self::jsonfusion_type_hints_from_schema(&given_schema)?;
         let count_schema = make_count_schema();
         let cache = Self::create_schema(&input, count_schema.clone());
 
@@ -79,6 +90,7 @@ impl ConvertWriterExec {
             input_schema,
             given_schema,
             json_columns,
+            json_hints,
             expand_json,
             output_path,
             count_schema,
@@ -95,9 +107,9 @@ impl ConvertWriterExec {
             .iter()
             .filter_map(|field| {
                 // Check for JSONFUSION metadata
-                if let Some(metadata_value) = field.metadata().get("JSONFUSION") {
+                if let Some(metadata_value) = field.metadata().get(JSONFUSION_METADATA_KEY) {
                     // Verify metadata value is "true"
-                    if metadata_value == "true" {
+                    if metadata_value.eq_ignore_ascii_case("true") {
                         Some(field.name().clone())
                     } else {
                         None
@@ -109,6 +121,29 @@ impl ConvertWriterExec {
             .collect();
 
         Ok(json_columns)
+    }
+
+    pub fn jsonfusion_type_hints_from_schema(
+        schema: &SchemaRef,
+    ) -> Result<HashMap<String, Vec<JsonFusionPathHint>>> {
+        let mut hints = HashMap::new();
+        for field in schema.fields().iter() {
+            let Some(metadata_value) = field.metadata().get(JSONFUSION_METADATA_KEY) else {
+                continue;
+            };
+            if !metadata_value.eq_ignore_ascii_case("true") {
+                continue;
+            }
+            let Some(encoded) = field.metadata().get(JSONFUSION_HINTS_KEY) else {
+                continue;
+            };
+            let specs = decode_jsonfusion_hints(encoded)?;
+            let parsed = specs_to_hints(&specs)?;
+            if !parsed.is_empty() {
+                hints.insert(field.name().clone(), parsed);
+            }
+        }
+        Ok(hints)
     }
 
     fn create_schema(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
@@ -215,12 +250,19 @@ impl ExecutionPlan for ConvertWriterExec {
         let count_schema = Arc::clone(&self.count_schema);
         let output_path = self.output_path.clone();
         let json_columns = self.json_columns.clone();
+        let json_hints = self.json_hints.clone();
         let input_schema = Arc::clone(&self.input_schema);
 
         let self_clone = Arc::new(self.clone());
         let stream = futures::stream::once(async move {
             self_clone
-                .write_all_data(data, &input_schema, &json_columns, &output_path)
+                .write_all_data(
+                    data,
+                    &input_schema,
+                    &json_columns,
+                    &json_hints,
+                    &output_path,
+                )
                 .await
                 .map(make_count_batch)
         })
@@ -257,7 +299,11 @@ impl ConvertWriterExec {
     }
 
     /// Process JSON data in specified columns, expanding them into Arrow columnar format
-    fn process_json_columns(batch: &RecordBatch, json_columns: &[String]) -> Result<RecordBatch> {
+    fn process_json_columns(
+        batch: &RecordBatch,
+        json_columns: &[String],
+        json_hints: &HashMap<String, Vec<JsonFusionPathHint>>,
+    ) -> Result<RecordBatch> {
         // If no JSON columns, return original batch unchanged
         if json_columns.is_empty() {
             return Ok(batch.clone());
@@ -268,7 +314,8 @@ impl ConvertWriterExec {
         // Step 1: Process each JSON column with parse-once approach using JsonColumnProcessor
         let mut column_processors = HashMap::new();
         for json_col_name in json_columns {
-            let mut processor = JsonColumnProcessor::new(json_col_name.clone(), row_count);
+            let hints = json_hints.get(json_col_name).cloned().unwrap_or_default();
+            let mut processor = JsonColumnProcessor::new(json_col_name.clone(), row_count, hints);
 
             // Find the column in the batch
             let col_index = batch.schema().column_with_name(json_col_name).map(|c| c.0);
@@ -336,6 +383,7 @@ impl ConvertWriterExec {
         mut data: SendableRecordBatchStream,
         _input_schema: &SchemaRef,
         json_columns: &[String],
+        json_hints: &HashMap<String, Vec<JsonFusionPathHint>>,
         output_path: &std::path::Path,
     ) -> Result<u64> {
         let mut total_rows = 0u64;
@@ -349,7 +397,7 @@ impl ConvertWriterExec {
 
             // Process JSON columns if any
             let processed_batch = if self.expand_json {
-                Self::process_json_columns(&batch, json_columns)?
+                Self::process_json_columns(&batch, json_columns, json_hints)?
             } else {
                 batch.clone()
             };
@@ -715,16 +763,19 @@ pub struct JsonColumnProcessor {
     column_name: String,
     /// Row count for validation
     row_count: usize,
+    /// Expected path types from CREATE TABLE hints
+    type_hints: Vec<JsonFusionPathHint>,
 }
 
 impl JsonColumnProcessor {
     /// Create a new JSON column processor
-    pub fn new(column_name: String, row_count: usize) -> Self {
+    pub fn new(column_name: String, row_count: usize, type_hints: Vec<JsonFusionPathHint>) -> Self {
         Self {
             field_schemas: HashMap::new(),
             parsed_values: vec![None; row_count],
             column_name,
             row_count,
+            type_hints,
         }
     }
 
@@ -748,6 +799,7 @@ impl JsonColumnProcessor {
         let mut json_bytes = json_str.as_bytes().to_vec();
         match simd_json::from_slice::<OwnedValue>(&mut json_bytes) {
             Ok(owned_value) => {
+                self.validate_expected_types(&owned_value)?;
                 // Use parsed value for schema inference - handle like infer_from_json_string does
                 self.infer_from_owned_value(&owned_value)?;
                 // Store parsed value for later Arrow conversion
@@ -766,6 +818,65 @@ impl JsonColumnProcessor {
         }
     }
 
+    fn validate_expected_types(&self, value: &OwnedValue) -> Result<()> {
+        if self.type_hints.is_empty() {
+            return Ok(());
+        }
+
+        for hint in &self.type_hints {
+            let mut current = value;
+            let mut missing = false;
+            for segment in &hint.path {
+                match current {
+                    OwnedValue::Object(obj) => match obj.get(segment) {
+                        Some(child) => current = child,
+                        None => {
+                            missing = true;
+                            break;
+                        }
+                    },
+                    _ => {
+                        missing = true;
+                        break;
+                    }
+                }
+            }
+
+            if missing {
+                if !hint.nullable {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "JSONFusion column '{}' is missing required path '{}'",
+                        self.column_name,
+                        hint.path.join(".")
+                    )));
+                }
+                continue;
+            }
+
+            if current.value_type() == ValueType::Null {
+                if !hint.nullable {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "JSONFusion column '{}' has null for required path '{}'",
+                        self.column_name,
+                        hint.path.join(".")
+                    )));
+                }
+                continue;
+            }
+
+            if !json_value_matches_type(current, &hint.data_type) {
+                return Err(datafusion_common::DataFusionError::Execution(format!(
+                    "JSONFusion column '{}' has type mismatch at '{}': expected {:?}",
+                    self.column_name,
+                    hint.path.join("."),
+                    hint.data_type
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get the inferred Arrow schema from processed JSON values
     pub fn get_inferred_schema(&self) -> Schema {
         let mut fields = Vec::new();
@@ -774,6 +885,35 @@ impl JsonColumnProcessor {
         }
         fields.sort_unstable_by(|a, b| a.name().cmp(b.name()));
         Schema::new(fields)
+    }
+
+    fn get_inferred_schema_with_hints(&self) -> Schema {
+        let inferred = self.get_inferred_schema();
+        if self.type_hints.is_empty() {
+            return inferred;
+        }
+
+        let mut data_type = DataType::Struct(
+            inferred
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        for hint in &self.type_hints {
+            data_type = apply_hint_to_type(&data_type, &hint.path, &hint.data_type);
+        }
+
+        match data_type {
+            DataType::Struct(fields) => Schema::new(
+                fields
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect::<Vec<_>>(),
+            ),
+            other => Schema::new(vec![Field::new("value", other, true)]),
+        }
     }
 
     /// Infer schema from a parsed JSON value
@@ -1087,7 +1227,7 @@ impl JsonColumnProcessor {
         }
 
         // Infer the unified structure from all parsed JSON values
-        let inferred_schema = self.get_inferred_schema();
+        let inferred_schema = self.get_inferred_schema_with_hints();
 
         if inferred_schema.fields().is_empty() {
             // No structure inferred, return null array
@@ -1147,24 +1287,21 @@ impl JsonColumnProcessor {
     /// Universal array builder factory - creates Arrow builders for any DataType recursively
     fn create_array_builder_for_type(data_type: &DataType) -> Result<Box<dyn ArrayBuilder>> {
         match data_type {
-            DataType::Boolean => Ok(Box::new(BooleanBuilder::new())),
-            DataType::Int64 => Ok(Box::new(Int64Builder::new())),
-            DataType::UInt64 => Ok(Box::new(UInt64Builder::new())),
-            DataType::Float64 => Ok(Box::new(Float64Builder::new())),
-            DataType::Utf8 => Ok(Box::new(StringBuilder::new())),
-            DataType::List(field) => {
-                let values_builder = Self::create_array_builder_for_type(field.data_type())?;
-                Ok(Box::new(ListBuilder::new(values_builder)))
-            }
-            DataType::Struct(fields) => {
-                let field_builders: Result<Vec<_>, _> = fields
-                    .iter()
-                    .map(|f| Self::create_array_builder_for_type(f.data_type()))
-                    .collect();
-                let fields_vec: Vec<Field> = fields.iter().map(|f| f.as_ref().clone()).collect();
-                Ok(Box::new(StructBuilder::new(fields_vec, field_builders?)))
-            }
-            DataType::Null => Ok(Box::new(StringBuilder::new())), // Use string builder for null types
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::List(_)
+            | DataType::Struct(_)
+            | DataType::Null => Ok(make_builder(data_type, 0)),
             _ => Err(datafusion_common::DataFusionError::NotImplemented(format!(
                 "Array builder for type {data_type:?} not yet implemented"
             ))),
@@ -1185,6 +1322,69 @@ impl JsonColumnProcessor {
                 } else {
                     return Err(datafusion_common::DataFusionError::Internal(
                         "Builder type mismatch for Boolean".to_string(),
+                    ));
+                }
+            }
+            (DataType::Int8, Some(json_value)) => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<Int8Builder>() {
+                    match json_value {
+                        OwnedValue::Static(simd_json::StaticNode::I64(i))
+                            if *i >= i8::MIN as i64 && *i <= i8::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as i8);
+                        }
+                        OwnedValue::Static(simd_json::StaticNode::U64(u))
+                            if *u <= i8::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as i8);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                } else {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "Builder type mismatch for Int8".to_string(),
+                    ));
+                }
+            }
+            (DataType::Int16, Some(json_value)) => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<Int16Builder>() {
+                    match json_value {
+                        OwnedValue::Static(simd_json::StaticNode::I64(i))
+                            if *i >= i16::MIN as i64 && *i <= i16::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as i16);
+                        }
+                        OwnedValue::Static(simd_json::StaticNode::U64(u))
+                            if *u <= i16::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as i16);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                } else {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "Builder type mismatch for Int16".to_string(),
+                    ));
+                }
+            }
+            (DataType::Int32, Some(json_value)) => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<Int32Builder>() {
+                    match json_value {
+                        OwnedValue::Static(simd_json::StaticNode::I64(i))
+                            if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as i32);
+                        }
+                        OwnedValue::Static(simd_json::StaticNode::U64(u))
+                            if *u <= i32::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as i32);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                } else {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "Builder type mismatch for Int32".to_string(),
                     ));
                 }
             }
@@ -1209,6 +1409,69 @@ impl JsonColumnProcessor {
                     ));
                 }
             }
+            (DataType::UInt8, Some(json_value)) => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<UInt8Builder>() {
+                    match json_value {
+                        OwnedValue::Static(simd_json::StaticNode::U64(u))
+                            if *u <= u8::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as u8);
+                        }
+                        OwnedValue::Static(simd_json::StaticNode::I64(i))
+                            if *i >= 0 && *i <= u8::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as u8);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                } else {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "Builder type mismatch for UInt8".to_string(),
+                    ));
+                }
+            }
+            (DataType::UInt16, Some(json_value)) => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<UInt16Builder>() {
+                    match json_value {
+                        OwnedValue::Static(simd_json::StaticNode::U64(u))
+                            if *u <= u16::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as u16);
+                        }
+                        OwnedValue::Static(simd_json::StaticNode::I64(i))
+                            if *i >= 0 && *i <= u16::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as u16);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                } else {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "Builder type mismatch for UInt16".to_string(),
+                    ));
+                }
+            }
+            (DataType::UInt32, Some(json_value)) => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<UInt32Builder>() {
+                    match json_value {
+                        OwnedValue::Static(simd_json::StaticNode::U64(u))
+                            if *u <= u32::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as u32);
+                        }
+                        OwnedValue::Static(simd_json::StaticNode::I64(i))
+                            if *i >= 0 && *i <= u32::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as u32);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                } else {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "Builder type mismatch for UInt32".to_string(),
+                    ));
+                }
+            }
             (DataType::Float64, Some(json_value)) => {
                 if let Some(float_builder) = builder.as_any_mut().downcast_mut::<Float64Builder>() {
                     match json_value {
@@ -1226,6 +1489,26 @@ impl JsonColumnProcessor {
                 } else {
                     return Err(datafusion_common::DataFusionError::Internal(
                         "Builder type mismatch for Float64".to_string(),
+                    ));
+                }
+            }
+            (DataType::Float32, Some(json_value)) => {
+                if let Some(float_builder) = builder.as_any_mut().downcast_mut::<Float32Builder>() {
+                    match json_value {
+                        OwnedValue::Static(simd_json::StaticNode::F64(f)) => {
+                            float_builder.append_value(*f as f32);
+                        }
+                        OwnedValue::Static(simd_json::StaticNode::I64(i)) => {
+                            float_builder.append_value(*i as f32);
+                        }
+                        OwnedValue::Static(simd_json::StaticNode::U64(u)) => {
+                            float_builder.append_value(*u as f32);
+                        }
+                        _ => float_builder.append_null(),
+                    }
+                } else {
+                    return Err(datafusion_common::DataFusionError::Internal(
+                        "Builder type mismatch for Float32".to_string(),
                     ));
                 }
             }
@@ -1335,6 +1618,60 @@ impl JsonColumnProcessor {
                     }
                 }
             }
+            DataType::Int8 => {
+                if let Some(int_builder) = struct_builder.field_builder::<Int8Builder>(field_index)
+                {
+                    match json_value {
+                        Some(OwnedValue::Static(simd_json::StaticNode::I64(i)))
+                            if *i >= i8::MIN as i64 && *i <= i8::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as i8);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::U64(u)))
+                            if *u <= i8::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as i8);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                }
+            }
+            DataType::Int16 => {
+                if let Some(int_builder) = struct_builder.field_builder::<Int16Builder>(field_index)
+                {
+                    match json_value {
+                        Some(OwnedValue::Static(simd_json::StaticNode::I64(i)))
+                            if *i >= i16::MIN as i64 && *i <= i16::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as i16);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::U64(u)))
+                            if *u <= i16::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as i16);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                }
+            }
+            DataType::Int32 => {
+                if let Some(int_builder) = struct_builder.field_builder::<Int32Builder>(field_index)
+                {
+                    match json_value {
+                        Some(OwnedValue::Static(simd_json::StaticNode::I64(i)))
+                            if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as i32);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::U64(u)))
+                            if *u <= i32::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as i32);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                }
+            }
             DataType::Int64 => {
                 if let Some(int_builder) = struct_builder.field_builder::<Int64Builder>(field_index)
                 {
@@ -1345,6 +1682,81 @@ impl JsonColumnProcessor {
                         Some(OwnedValue::Static(simd_json::StaticNode::U64(u))) => {
                             if *u <= i64::MAX as u64 {
                                 int_builder.append_value(*u as i64);
+                            } else {
+                                int_builder.append_null();
+                            }
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                }
+            }
+            DataType::UInt8 => {
+                if let Some(int_builder) = struct_builder.field_builder::<UInt8Builder>(field_index)
+                {
+                    match json_value {
+                        Some(OwnedValue::Static(simd_json::StaticNode::U64(u)))
+                            if *u <= u8::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as u8);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::I64(i)))
+                            if *i >= 0 && *i <= u8::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as u8);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                }
+            }
+            DataType::UInt16 => {
+                if let Some(int_builder) =
+                    struct_builder.field_builder::<UInt16Builder>(field_index)
+                {
+                    match json_value {
+                        Some(OwnedValue::Static(simd_json::StaticNode::U64(u)))
+                            if *u <= u16::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as u16);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::I64(i)))
+                            if *i >= 0 && *i <= u16::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as u16);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                }
+            }
+            DataType::UInt32 => {
+                if let Some(int_builder) =
+                    struct_builder.field_builder::<UInt32Builder>(field_index)
+                {
+                    match json_value {
+                        Some(OwnedValue::Static(simd_json::StaticNode::U64(u)))
+                            if *u <= u32::MAX as u64 =>
+                        {
+                            int_builder.append_value(*u as u32);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::I64(i)))
+                            if *i >= 0 && *i <= u32::MAX as i64 =>
+                        {
+                            int_builder.append_value(*i as u32);
+                        }
+                        _ => int_builder.append_null(),
+                    }
+                }
+            }
+            DataType::UInt64 => {
+                if let Some(int_builder) =
+                    struct_builder.field_builder::<UInt64Builder>(field_index)
+                {
+                    match json_value {
+                        Some(OwnedValue::Static(simd_json::StaticNode::U64(u))) => {
+                            int_builder.append_value(*u);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::I64(i))) => {
+                            if *i >= 0 {
+                                int_builder.append_value(*i as u64);
                             } else {
                                 int_builder.append_null();
                             }
@@ -1366,6 +1778,24 @@ impl JsonColumnProcessor {
                         }
                         Some(OwnedValue::Static(simd_json::StaticNode::U64(u))) => {
                             float_builder.append_value(*u as f64);
+                        }
+                        _ => float_builder.append_null(),
+                    }
+                }
+            }
+            DataType::Float32 => {
+                if let Some(float_builder) =
+                    struct_builder.field_builder::<Float32Builder>(field_index)
+                {
+                    match json_value {
+                        Some(OwnedValue::Static(simd_json::StaticNode::F64(f))) => {
+                            float_builder.append_value(*f as f32);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::I64(i))) => {
+                            float_builder.append_value(*i as f32);
+                        }
+                        Some(OwnedValue::Static(simd_json::StaticNode::U64(u))) => {
+                            float_builder.append_value(*u as f32);
                         }
                         _ => float_builder.append_null(),
                     }
@@ -1430,14 +1860,49 @@ impl JsonColumnProcessor {
                     bool_builder.append_null();
                 }
             }
+            DataType::Int8 => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<Int8Builder>() {
+                    int_builder.append_null();
+                }
+            }
+            DataType::Int16 => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<Int16Builder>() {
+                    int_builder.append_null();
+                }
+            }
+            DataType::Int32 => {
+                if let Some(int_builder) = builder.as_any_mut().downcast_mut::<Int32Builder>() {
+                    int_builder.append_null();
+                }
+            }
             DataType::Int64 => {
                 if let Some(int_builder) = builder.as_any_mut().downcast_mut::<Int64Builder>() {
                     int_builder.append_null();
                 }
             }
+            DataType::UInt8 => {
+                if let Some(uint_builder) = builder.as_any_mut().downcast_mut::<UInt8Builder>() {
+                    uint_builder.append_null();
+                }
+            }
+            DataType::UInt16 => {
+                if let Some(uint_builder) = builder.as_any_mut().downcast_mut::<UInt16Builder>() {
+                    uint_builder.append_null();
+                }
+            }
+            DataType::UInt32 => {
+                if let Some(uint_builder) = builder.as_any_mut().downcast_mut::<UInt32Builder>() {
+                    uint_builder.append_null();
+                }
+            }
             DataType::UInt64 => {
                 if let Some(uint_builder) = builder.as_any_mut().downcast_mut::<UInt64Builder>() {
                     uint_builder.append_null();
+                }
+            }
+            DataType::Float32 => {
+                if let Some(float_builder) = builder.as_any_mut().downcast_mut::<Float32Builder>() {
+                    float_builder.append_null();
                 }
             }
             DataType::Float64 => {
@@ -1524,6 +1989,14 @@ impl JsonColumnProcessor {
                 }
             }
         }
+    }
+}
+
+fn json_value_matches_type(value: &OwnedValue, data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Struct(_) => matches!(value, OwnedValue::Object(_)),
+        DataType::List(_) => matches!(value, OwnedValue::Array(_)),
+        _ => scalar_from_json_value(value, data_type).is_some(),
     }
 }
 
@@ -1621,7 +2094,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_simple_object() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Test with simple JSON object
         let json_str = r#"{"name": "Alice", "age": 30, "active": true}"#;
@@ -1647,7 +2120,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_nested_object() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Test with nested JSON object
         let json_str = r#"{"user": {"name": "Bob", "details": {"city": "NYC", "zip": 10001}}}"#;
@@ -1685,7 +2158,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_array() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Test with array
         let json_str = r#"{"numbers": [1, 2, 3], "tags": ["a", "b", "c"]}"#;
@@ -1747,8 +2220,9 @@ mod tests {
 
         // Test JSON processing
         let json_columns = vec!["user_data".to_string()];
+        let json_hints = HashMap::new();
         let processed_batch =
-            ConvertWriterExec::process_json_columns(&original_batch, &json_columns)?;
+            ConvertWriterExec::process_json_columns(&original_batch, &json_columns, &json_hints)?;
 
         // Construct expected schema with full structural replacement
         let expected_user_data_struct = DataType::Struct(
@@ -1783,8 +2257,41 @@ mod tests {
     }
 
     #[test]
+    fn test_jsonfusion_hint_rejects_type_mismatch() -> Result<()> {
+        let hints = vec![crate::jsonfusion_hints::JsonFusionPathHintSpec {
+            path: "email".to_string(),
+            sql_type: "String".to_string(),
+            nullable: false,
+        }];
+        let encoded =
+            crate::jsonfusion_hints::encode_jsonfusion_hints(&hints)?.expect("hints should encode");
+
+        let mut metadata = HashMap::new();
+        metadata.insert("JSONFUSION".to_string(), "true".to_string());
+        metadata.insert(
+            crate::jsonfusion_hints::JSONFUSION_HINTS_KEY.to_string(),
+            encoded,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data", DataType::Utf8, true).with_metadata(metadata),
+        ]));
+
+        let json_columns = vec!["data".to_string()];
+        let json_hints = ConvertWriterExec::jsonfusion_type_hints_from_schema(&schema)?;
+
+        let json_array = Arc::new(StringArray::from(vec![Some(r#"{"email": 42}"#)]));
+        let batch = RecordBatch::try_new(schema, vec![json_array])?;
+
+        let result = ConvertWriterExec::process_json_columns(&batch, &json_columns, &json_hints);
+        assert!(result.is_err());
+
+        Ok(())
+    }
+
+    #[test]
     fn test_json_schema_inferrer_array_of_structs_different_schemas() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Array where each object has different fields
         let json_str = r#"[
@@ -1825,7 +2332,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_array_with_type_conflicts() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Array where same field has different types
         let json_str = r#"[
@@ -1865,7 +2372,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_nested_arrays_in_objects() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Object containing arrays of objects
         let json_str = r#"{
@@ -1904,7 +2411,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_deep_nesting() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Deep nested structure
         let json_str = r#"{
@@ -1975,7 +2482,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_array_mixed_primitives() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Array with mixed primitive types
         let json_str = r#"[1, 2.5, "hello", true]"#;
@@ -1998,7 +2505,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_array_of_arrays() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Array of arrays (without empty array to avoid ambiguity)
         let json_str = r#"[[1, 2], [3, 4, 5], [6]]"#;
@@ -2022,7 +2529,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_empty_array_handling() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Test that empty arrays fall back to reasonable defaults
         let json_str = r#"{"mixed_arrays": [[], ["hello"], []]}"#;
@@ -2046,7 +2553,7 @@ mod tests {
 
     #[test]
     fn test_json_schema_inferrer_empty_and_null_handling() -> Result<()> {
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
         // Array with empty objects and nulls
         let json_str = r#"[
@@ -2299,7 +2806,7 @@ mod tests {
     fn test_unmatched_schema_panic_reproduction() -> Result<()> {
         // Test case that reproduces the "unmatched schema" panic
         // This simulates the INSERT VALUES scenario that caused the panic
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 3);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 3, Vec::new());
 
         // These JSON objects have different schemas - some have different nested fields
         let json_objects = vec![
@@ -2362,7 +2869,7 @@ mod tests {
     #[test]
     fn test_create_nested_list_of_lists() -> Result<()> {
         // Test List<List<String>> - arrays of string arrays (like tags of tags)
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2, Vec::new());
 
         let json_objects = vec![
             r#"[["red", "blue"], ["green", "yellow"], ["black"]]"#,
@@ -2397,7 +2904,7 @@ mod tests {
     #[test]
     fn test_create_list_of_structs() -> Result<()> {
         // Test List<Struct> - arrays of objects
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2, Vec::new());
 
         let json_objects = vec![
             r#"[{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]"#,
@@ -2440,7 +2947,7 @@ mod tests {
     #[test]
     fn test_create_struct_with_list_fields() -> Result<()> {
         // Test Struct<List> - objects with array fields
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2, Vec::new());
 
         let json_objects = vec![
             r#"{"user": "Alice", "tags": ["admin", "user"], "scores": [95, 87, 92]}"#,
@@ -2485,7 +2992,7 @@ mod tests {
     fn test_create_deeply_nested_no_string_fallbacks() -> Result<()> {
         // Test complex nesting: List<Struct<List<Int64>>>
         // This would have fallen back to strings in the old approach
-        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2);
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2, Vec::new());
 
         let json_objects = vec![
             r#"[{"name": "team1", "scores": [95, 87, 92]}, {"name": "team2", "scores": [78, 84]}]"#,

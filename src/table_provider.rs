@@ -28,6 +28,10 @@ use datafusion_expr::dml::InsertOp;
 use uuid::Uuid;
 
 use crate::convert_writer::ConvertWriterExec;
+use crate::jsonfusion_hints::{
+    JSONFUSION_HINTS_KEY, JSONFUSION_METADATA_KEY, JsonFusionColumnHints, apply_hint_to_type,
+    encode_jsonfusion_hints,
+};
 use crate::manifest::{Manifest, ManifestUpdaterExec};
 
 #[derive(Debug)]
@@ -316,46 +320,6 @@ fn apply_hints_to_field(field: &Field, hints: &[(Vec<String>, DataType)]) -> Fie
         .with_metadata(field.metadata().clone())
 }
 
-fn apply_hint_to_type(data_type: &DataType, path: &[String], hint: &DataType) -> DataType {
-    if path.is_empty() {
-        return hint.clone();
-    }
-    match data_type {
-        DataType::Struct(fields) => {
-            let mut new_fields: Vec<Field> =
-                fields.iter().map(|field| field.as_ref().clone()).collect();
-            let mut updated = false;
-            for field in new_fields.iter_mut() {
-                if field.name() == path[0].as_str() {
-                    let updated_type = apply_hint_to_type(field.data_type(), &path[1..], hint);
-                    *field = Field::new(field.name(), updated_type, field.is_nullable())
-                        .with_metadata(field.metadata().clone());
-                    updated = true;
-                    break;
-                }
-            }
-            if !updated {
-                let child_type = build_type_for_path(&path[1..], hint);
-                new_fields.push(Field::new(path[0].clone(), child_type, true));
-            }
-            new_fields.sort_unstable_by(|a, b| a.name().cmp(b.name()));
-            DataType::Struct(new_fields.into())
-        }
-        _ => {
-            let child_type = build_type_for_path(&path[1..], hint);
-            DataType::Struct(vec![Field::new(path[0].clone(), child_type, true)].into())
-        }
-    }
-}
-
-fn build_type_for_path(path: &[String], hint: &DataType) -> DataType {
-    if path.is_empty() {
-        return hint.clone();
-    }
-    let child_type = build_type_for_path(&path[1..], hint);
-    DataType::Struct(vec![Field::new(path[0].clone(), child_type, true)].into())
-}
-
 #[derive(Debug, Default)]
 struct JsonFusionSchemaAdapterFactory;
 
@@ -539,11 +503,11 @@ fn is_list_type(data_type: &DataType) -> bool {
 pub struct JsonFusionSchemaProvider {
     base_dir: PathBuf,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
-    jsonfusion_columns: Arc<RwLock<Vec<String>>>,
+    jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>,
 }
 
 impl JsonFusionSchemaProvider {
-    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<Vec<String>>>) -> Self {
+    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>) -> Self {
         Self {
             base_dir,
             tables: RwLock::new(HashMap::new()),
@@ -633,29 +597,31 @@ impl SchemaProvider for JsonFusionSchemaProvider {
         incoming_table: Arc<dyn TableProvider>,
     ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         // Get and clear the JSONFUSION columns from shared state
-        let jsonfusion_column_names = if let Ok(mut columns) = self.jsonfusion_columns.write() {
+        let mut jsonfusion_column_hints = if let Ok(mut columns) = self.jsonfusion_columns.write() {
             std::mem::take(&mut *columns)
         } else {
-            Vec::new()
+            JsonFusionColumnHints::new()
         };
 
         // Create a modified schema with JSONFUSION metadata
         let original_schema = incoming_table.schema();
-        let fields_with_metadata: Vec<Field> = original_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                if jsonfusion_column_names.contains(field.name()) {
-                    // Add JSONFUSION metadata to this field
-                    let mut metadata = field.metadata().clone();
-                    metadata.insert("JSONFUSION".to_string(), "true".to_string());
-                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                        .with_metadata(metadata)
-                } else {
-                    field.as_ref().clone()
+        let mut fields_with_metadata = Vec::with_capacity(original_schema.fields().len());
+        for field in original_schema.fields().iter() {
+            if let Some(hints) = jsonfusion_column_hints.remove(field.name()) {
+                // Add JSONFUSION metadata to this field
+                let mut metadata = field.metadata().clone();
+                metadata.insert(JSONFUSION_METADATA_KEY.to_string(), "true".to_string());
+                if let Some(encoded) = encode_jsonfusion_hints(&hints)? {
+                    metadata.insert(JSONFUSION_HINTS_KEY.to_string(), encoded);
                 }
-            })
-            .collect();
+                fields_with_metadata.push(
+                    Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                        .with_metadata(metadata),
+                );
+            } else {
+                fields_with_metadata.push(field.as_ref().clone());
+            }
+        }
 
         let schema_with_metadata = Arc::new(Schema::new(fields_with_metadata));
 
@@ -714,11 +680,11 @@ pub struct JsonFusionCatalogProvider {
     base_dir: PathBuf,
     schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
     #[allow(dead_code)]
-    jsonfusion_columns: Arc<RwLock<Vec<String>>>,
+    jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>,
 }
 
 impl JsonFusionCatalogProvider {
-    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<Vec<String>>>) -> Self {
+    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>) -> Self {
         let mut schemas = HashMap::new();
 
         // Auto-register the "public" schema
@@ -800,11 +766,11 @@ pub struct JsonFusionCatalogProviderList {
     base_dir: PathBuf,
     catalogs: RwLock<HashMap<String, Arc<dyn CatalogProvider>>>,
     #[allow(dead_code)]
-    jsonfusion_columns: Arc<RwLock<Vec<String>>>,
+    jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>,
 }
 
 impl JsonFusionCatalogProviderList {
-    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<Vec<String>>>) -> Self {
+    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>) -> Self {
         let mut catalogs = HashMap::new();
 
         // Auto-register the "jsonfusion" catalog with "public" schema

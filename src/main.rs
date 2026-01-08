@@ -2,12 +2,15 @@ mod convert_writer;
 mod get_field_typed;
 mod get_field_typed_type_inference;
 mod json_display;
+mod jsonfusion_hints;
+mod jsonfusion_hooks;
 mod manifest;
 mod schema;
 mod sql_ast_rewriter;
 mod table_provider;
 mod type_planner;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -18,7 +21,7 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_pg_catalog::pg_catalog::context::EmptyContextProvider;
 use datafusion_postgres::auth::AuthManager;
-use datafusion_postgres::{ServerOptions, serve};
+use datafusion_postgres::{QueryHook, ServerOptions, serve_with_hooks};
 use object_store::local::LocalFileSystem;
 use url::Url;
 
@@ -29,8 +32,9 @@ async fn main() -> Result<(), std::io::Error> {
     // Define hardcoded base directory for JSON files
     let json_base_dir = PathBuf::from("./jsonfusion");
 
-    // Create shared state for JSONFUSION columns
-    let jsonfusion_columns: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+    // Create shared state for JSONFUSION columns and path hints
+    let jsonfusion_columns: Arc<RwLock<jsonfusion_hints::JsonFusionColumnHints>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     // Configure a 4k batch size
     let config = SessionConfig::new()
@@ -66,9 +70,7 @@ async fn main() -> Result<(), std::io::Error> {
         .with_expr_planners(vec![Arc::new(
             sql_ast_rewriter::JsonFusionExprPlanner::new(),
         )])
-        .with_type_planner(Arc::new(type_planner::JsonTypePlanner::new(
-            jsonfusion_columns.clone(),
-        )))
+        .with_type_planner(Arc::new(type_planner::JsonTypePlanner::new()))
         .with_catalog_list(catalog_list)
         // include support for built in functions and configurations
         .with_default_features()
@@ -92,10 +94,15 @@ async fn main() -> Result<(), std::io::Error> {
         .with_host("127.0.0.1".to_string())
         .with_port(5432);
 
-    serve(
+    let hooks: Vec<Arc<dyn QueryHook>> = vec![Arc::new(
+        jsonfusion_hooks::JsonFusionCreateTableHook::new(jsonfusion_columns.clone()),
+    )];
+
+    serve_with_hooks(
         session_context,
         &server_options,
         Arc::new(AuthManager::new()),
+        hooks,
     )
     .await
 }

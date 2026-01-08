@@ -562,7 +562,10 @@ fn extract_json_path<'a>(value: &'a OwnedValue, segments: &[&str]) -> Option<&'a
     Some(current)
 }
 
-fn scalar_from_json_value(value: &OwnedValue, target_type: &DataType) -> Option<ScalarValue> {
+pub(crate) fn scalar_from_json_value(
+    value: &OwnedValue,
+    target_type: &DataType,
+) -> Option<ScalarValue> {
     match target_type {
         DataType::Boolean => value.as_bool().map(|val| ScalarValue::Boolean(Some(val))),
         DataType::Int8
