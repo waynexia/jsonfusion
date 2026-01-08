@@ -9,9 +9,9 @@ use std::sync::{Arc, RwLock};
 use arrow::array::builder::make_builder;
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder,
-    Int16Builder, Int32Builder, Int64Builder, ListBuilder, NullArray, RecordBatch, StringBuilder,
-    StructArray, StructBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Array,
-    UInt64Builder,
+    Int16Builder, Int32Builder, Int64Builder, ListBuilder, NullArray, NullBuilder, RecordBatch,
+    StringBuilder, StructArray, StructBuilder, UInt8Builder, UInt16Builder, UInt32Builder,
+    UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::TaskContext;
@@ -1817,6 +1817,12 @@ impl JsonColumnProcessor {
                     }
                 }
             }
+            DataType::Null => {
+                if let Some(null_builder) = struct_builder.field_builder::<NullBuilder>(field_index)
+                {
+                    null_builder.append_null();
+                }
+            }
             DataType::List(_) => {
                 if let Some(list_builder) =
                     struct_builder.field_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_index)
@@ -1928,6 +1934,11 @@ impl JsonColumnProcessor {
                     struct_builder.append(false); // Append null struct
                 }
             }
+            DataType::Null => {
+                if let Some(null_builder) = builder.as_any_mut().downcast_mut::<NullBuilder>() {
+                    null_builder.append_null();
+                }
+            }
             _ => {
                 // For other types, try string builder as fallback
                 if let Some(string_builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() {
@@ -2020,7 +2031,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Int64Array, NullArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::{MemTable, TableProvider};
@@ -2862,6 +2873,27 @@ mod tests {
             "Schema mismatch. Expected: {expected_struct_type:#?}, Got: {data_type:#?}"
         );
         assert_eq!(array.len(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_null_only_column_produces_expected_length() -> Result<()> {
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 3, Vec::new());
+
+        for (i, json_str) in ["null", "null", "null"].iter().enumerate() {
+            processor.process_json_string(i, json_str)?;
+        }
+
+        let (data_type, array) = processor.convert_to_structural_array()?;
+
+        assert_eq!(data_type, DataType::Null);
+        assert_eq!(array.len(), 3);
+        let null_array = array
+            .as_any()
+            .downcast_ref::<NullArray>()
+            .expect("Expected NullArray");
+        assert_eq!(null_array.len(), 3);
 
         Ok(())
     }
