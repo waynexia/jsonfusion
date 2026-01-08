@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef};
+use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{ColumnarValue, ScalarUDF, Signature, SimpleScalarUDF, Volatility};
+use parquet::variant::{Variant, VariantArray};
 use serde_json::{Map, Value};
 
 /// Creates a `json_display` scalar UDF that converts complex Arrow types to JSON strings
@@ -35,6 +36,27 @@ pub fn json_display_udf() -> ScalarUDF {
 
 /// Convert an Arrow array to JSON string representations
 pub(crate) fn array_to_json_strings(array: &ArrayRef) -> Result<ArrayRef> {
+    if let Some(variant_array) = try_variant_array(array) {
+        let mut json_strings = Vec::with_capacity(variant_array.len());
+        for i in 0..variant_array.len() {
+            if variant_array.is_null(i) {
+                json_strings.push(None);
+            } else {
+                let json_value = json_value_from_variant(variant_array.value(i))?;
+                if is_empty_value(&json_value) {
+                    json_strings.push(None);
+                } else {
+                    let json_string = serde_json::to_string(&json_value).map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to serialize JSON: {e}"))
+                    })?;
+                    json_strings.push(Some(json_string));
+                }
+            }
+        }
+        let string_array = StringArray::from_iter(json_strings);
+        return Ok(Arc::new(string_array));
+    }
+
     let mut json_strings = Vec::with_capacity(array.len());
 
     for i in 0..array.len() {
@@ -60,6 +82,19 @@ pub(crate) fn array_to_json_strings(array: &ArrayRef) -> Result<ArrayRef> {
 }
 
 pub(crate) fn array_value_to_json_string(array: &ArrayRef, index: usize) -> Result<Option<String>> {
+    if let Some(variant_array) = try_variant_array(array) {
+        if variant_array.is_null(index) {
+            return Ok(None);
+        }
+        let json_value = json_value_from_variant(variant_array.value(index))?;
+        if is_empty_value(&json_value) {
+            return Ok(None);
+        }
+        let json_string = serde_json::to_string(&json_value)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to serialize JSON: {e}")))?;
+        return Ok(Some(json_string));
+    }
+
     if array.is_null(index) {
         return Ok(None);
     }
@@ -73,9 +108,75 @@ pub(crate) fn array_value_to_json_string(array: &ArrayRef, index: usize) -> Resu
     Ok(Some(json_string))
 }
 
+fn try_variant_array(array: &ArrayRef) -> Option<VariantArray> {
+    VariantArray::try_new(array.as_ref()).ok()
+}
+
+pub(crate) fn json_value_from_variant(variant: parquet::variant::Variant<'_, '_>) -> Result<Value> {
+    match variant {
+        Variant::Null => Ok(Value::Null),
+        Variant::BooleanTrue => Ok(Value::Bool(true)),
+        Variant::BooleanFalse => Ok(Value::Bool(false)),
+        Variant::Int8(value) => Ok(Value::Number(serde_json::Number::from(value))),
+        Variant::Int16(value) => Ok(Value::Number(serde_json::Number::from(value))),
+        Variant::Int32(value) => Ok(Value::Number(serde_json::Number::from(value))),
+        Variant::Int64(value) => Ok(Value::Number(serde_json::Number::from(value))),
+        Variant::Float(value) => Ok(Value::Number(json_number_from_f64(value as f64))),
+        Variant::Double(value) => Ok(Value::Number(json_number_from_f64(value))),
+        Variant::Binary(value) => Ok(Value::String(bytes_to_hex(value))),
+        Variant::String(value) => Ok(Value::String(value.to_string())),
+        Variant::ShortString(value) => Ok(Value::String(value.as_str().to_string())),
+        Variant::Date(value) => Ok(Value::String(value.to_string())),
+        Variant::TimestampMicros(value) => Ok(Value::String(value.to_string())),
+        Variant::TimestampNtzMicros(value) => Ok(Value::String(value.to_string())),
+        Variant::TimestampNanos(value) => Ok(Value::String(value.to_string())),
+        Variant::TimestampNtzNanos(value) => Ok(Value::String(value.to_string())),
+        Variant::Decimal4(value) => Ok(Value::String(value.to_string())),
+        Variant::Decimal8(value) => Ok(Value::String(value.to_string())),
+        Variant::Decimal16(value) => Ok(Value::String(value.to_string())),
+        Variant::Time(value) => Ok(Value::String(value.to_string())),
+        Variant::Uuid(value) => Ok(Value::String(value.to_string())),
+        Variant::Object(object) => {
+            let mut map = Map::new();
+            for (key, value) in object.iter() {
+                map.insert(key.to_string(), json_value_from_variant(value)?);
+            }
+            Ok(Value::Object(map))
+        }
+        Variant::List(values) => {
+            let mut items = Vec::with_capacity(values.len());
+            for value in values.iter() {
+                items.push(json_value_from_variant(value)?);
+            }
+            Ok(Value::Array(items))
+        }
+    }
+}
+
+fn json_number_from_f64(value: f64) -> serde_json::Number {
+    serde_json::Number::from_f64(value).unwrap_or_else(|| serde_json::Number::from(0))
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 /// Convert a single array value at the given index to a JSON Value
 fn convert_array_value_to_json(array: &ArrayRef, index: usize) -> Result<Value> {
     use arrow::array::*;
+
+    if let Some(variant_array) = try_variant_array(array) {
+        if variant_array.is_null(index) {
+            return Ok(Value::Null);
+        }
+        return json_value_from_variant(variant_array.value(index));
+    }
 
     match array.data_type() {
         // Primitive types

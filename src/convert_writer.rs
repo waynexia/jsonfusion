@@ -11,7 +11,7 @@ use arrow::array::{
     Array, ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int8Builder,
     Int16Builder, Int32Builder, Int64Builder, ListBuilder, NullArray, NullBuilder, RecordBatch,
     StringBuilder, StructArray, StructBuilder, UInt8Builder, UInt16Builder, UInt32Builder,
-    UInt64Array, UInt64Builder,
+    UInt64Array, UInt64Builder, new_null_array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::TaskContext;
@@ -28,6 +28,10 @@ use datafusion_common::{Result, internal_err};
 use futures::StreamExt;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use parquet::variant::{
+    BuilderSpecificState, CastOptions as VariantCastOptions, ObjectBuilder, Variant,
+    VariantArrayBuilder, VariantBuilderExt, VariantType, cast_to_variant_with_options,
+};
 use simd_json::OwnedValue;
 use simd_json::prelude::*;
 
@@ -36,6 +40,205 @@ use crate::jsonfusion_hints::{
     JSONFUSION_HINTS_KEY, JSONFUSION_METADATA_KEY, JsonFusionPathHint, apply_hint_to_type,
     decode_jsonfusion_hints, specs_to_hints,
 };
+
+fn variant_struct_type() -> DataType {
+    DataType::Struct(
+        vec![
+            Field::new("metadata", DataType::BinaryView, false),
+            Field::new("value", DataType::BinaryView, false),
+        ]
+        .into(),
+    )
+}
+
+fn is_variant_struct_type(data_type: &DataType) -> bool {
+    let DataType::Struct(fields) = data_type else {
+        return false;
+    };
+    let mut has_metadata = false;
+    let mut has_value = false;
+    for field in fields.iter() {
+        match field.name().as_str() {
+            "metadata" if field.data_type() == &DataType::BinaryView => {
+                has_metadata = true;
+            }
+            "value" if field.data_type() == &DataType::BinaryView => {
+                has_value = true;
+            }
+            _ => {}
+        }
+    }
+    has_metadata && has_value
+}
+
+fn field_for_type(name: &str, data_type: DataType, nullable: bool) -> Field {
+    if is_variant_struct_type(&data_type) {
+        Field::new(name, data_type, nullable).with_extension_type(VariantType)
+    } else {
+        Field::new(name, data_type, nullable)
+    }
+}
+
+#[derive(Debug)]
+struct VariantArrayBuilderAdapter {
+    values: Vec<Option<OwnedValue>>,
+}
+
+impl VariantArrayBuilderAdapter {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn append_json_value(&mut self, json_value: Option<&OwnedValue>) -> Result<()> {
+        match json_value {
+            Some(value) if value.value_type() == ValueType::Null => {
+                self.values.push(None);
+            }
+            Some(value) => {
+                self.values.push(Some(value.clone()));
+            }
+            None => {
+                self.values.push(None);
+            }
+        }
+        Ok(())
+    }
+
+    fn append_null(&mut self) {
+        self.values.push(None);
+    }
+
+    fn build_array(&self) -> Result<ArrayRef> {
+        let mut builder = VariantArrayBuilder::new(self.values.len());
+        for value in &self.values {
+            match value {
+                None => builder.append_null(),
+                Some(value) => append_owned_value_to_variant_builder(&mut builder, value)?,
+            }
+        }
+        Ok(ArrayRef::from(builder.build()))
+    }
+}
+
+impl ArrayBuilder for VariantArrayBuilderAdapter {
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        let len = self.values.len();
+        let result = self
+            .build_array()
+            .unwrap_or_else(|_| new_null_array(&variant_struct_type(), len));
+        self.values.clear();
+        result
+    }
+
+    fn finish_cloned(&self) -> ArrayRef {
+        let len = self.values.len();
+        self.build_array()
+            .unwrap_or_else(|_| new_null_array(&variant_struct_type(), len))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn into_box_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+fn append_owned_value_to_variant_builder<B: VariantBuilderExt>(
+    builder: &mut B,
+    value: &OwnedValue,
+) -> Result<()> {
+    match value {
+        OwnedValue::Static(node) => append_static_node_to_variant_builder(builder, *node),
+        OwnedValue::String(value) => {
+            builder.append_value(value.as_str());
+            Ok(())
+        }
+        OwnedValue::Array(values) => {
+            let mut list_builder = builder.new_list();
+            for value in values.iter() {
+                append_owned_value_to_variant_builder(&mut list_builder, value)?;
+            }
+            list_builder.finish();
+            Ok(())
+        }
+        OwnedValue::Object(values) => {
+            let mut object_builder = builder.new_object();
+            append_owned_value_to_variant_object(&mut object_builder, values)?;
+            object_builder.finish();
+            Ok(())
+        }
+    }
+}
+
+fn append_static_node_to_variant_builder<B: VariantBuilderExt>(
+    builder: &mut B,
+    node: simd_json::StaticNode,
+) -> Result<()> {
+    match node {
+        simd_json::StaticNode::Null => builder.append_null(),
+        simd_json::StaticNode::Bool(value) => builder.append_value(value),
+        simd_json::StaticNode::I64(value) => builder.append_value(value),
+        simd_json::StaticNode::U64(value) => builder.append_value(value),
+        simd_json::StaticNode::F64(value) => builder.append_value(value),
+    }
+    Ok(())
+}
+
+fn append_owned_value_to_variant_object<S: BuilderSpecificState>(
+    builder: &mut ObjectBuilder<'_, S>,
+    values: &simd_json::owned::Object,
+) -> Result<()> {
+    for (key, value) in values.iter() {
+        match value {
+            OwnedValue::Static(node) => {
+                append_static_node_to_variant_object(builder, key, *node)?;
+            }
+            OwnedValue::String(value) => {
+                builder.insert(key, value.as_str());
+            }
+            OwnedValue::Array(values) => {
+                let mut list_builder = builder.new_list(key);
+                for value in values.iter() {
+                    append_owned_value_to_variant_builder(&mut list_builder, value)?;
+                }
+                list_builder.finish();
+            }
+            OwnedValue::Object(values) => {
+                let mut object_builder = builder.new_object(key);
+                append_owned_value_to_variant_object(&mut object_builder, values)?;
+                object_builder.finish();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_static_node_to_variant_object<S: BuilderSpecificState>(
+    builder: &mut ObjectBuilder<'_, S>,
+    key: &str,
+    node: simd_json::StaticNode,
+) -> Result<()> {
+    match node {
+        simd_json::StaticNode::Null => builder.insert(key, Variant::Null),
+        simd_json::StaticNode::Bool(value) => builder.insert(key, value),
+        simd_json::StaticNode::I64(value) => builder.insert(key, value),
+        simd_json::StaticNode::U64(value) => builder.insert(key, value),
+        simd_json::StaticNode::F64(value) => builder.insert(key, value),
+    }
+    Ok(())
+}
 /// Execution plan for writing record batches with JSON processing and Parquet output.
 ///
 /// Returns a single row with the number of values written
@@ -350,8 +553,8 @@ impl ConvertWriterExec {
                 // This is a JSON column - replace with structural type
                 if let Some(processor) = column_processors.get(field.name()) {
                     let (structural_type, structural_array) =
-                        processor.convert_to_structural_array()?;
-                    new_fields.push(Field::new(field.name(), structural_type, true));
+                        processor.convert_to_structural_array_preserve_root()?;
+                    new_fields.push(field_for_type(field.name(), structural_type, true));
                     new_columns.push(structural_array);
                 } else {
                     println!("[DEBUG] Processor missing for column: {}", field.name());
@@ -504,6 +707,19 @@ impl ConvertWriterExec {
                 if source_field.data_type() == target_field.data_type() {
                     // Types match - use the source column
                     target_arrays.push(source_struct.column(source_field_index).clone());
+                } else if is_variant_struct_type(target_field.data_type()) {
+                    let options = VariantCastOptions { strict: false };
+                    let variant_array = cast_to_variant_with_options(
+                        source_struct.column(source_field_index),
+                        &options,
+                    )
+                    .map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "Failed to cast struct field '{}' to variant: {e}",
+                            target_field.name()
+                        ))
+                    })?;
+                    target_arrays.push(ArrayRef::from(variant_array));
                 } else {
                     // Types don't match - create null array for target type
                     let null_array =
@@ -547,7 +763,7 @@ impl ConvertWriterExec {
                             existing_field.data_type(),
                             field.data_type(),
                         )?;
-                        let merged_field = Field::new(field.name(), resolved_type, true);
+                        let merged_field = field_for_type(field.name(), resolved_type, true);
                         merged_fields.insert(field.name().clone(), merged_field);
                     }
                     // If types match, keep the existing field
@@ -584,6 +800,19 @@ impl ConvertWriterExec {
                     if existing_field.data_type() == target_field.data_type() {
                         // Types match - use existing column
                         new_columns.push(Arc::clone(batch.column(col_index)));
+                    } else if is_variant_struct_type(target_field.data_type()) {
+                        let options = VariantCastOptions { strict: false };
+                        let variant_array = cast_to_variant_with_options(
+                            batch.column(col_index).as_ref(),
+                            &options,
+                        )
+                        .map_err(|e| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to cast column '{}' to variant: {e}",
+                                target_field.name()
+                            ))
+                        })?;
+                        new_columns.push(ArrayRef::from(variant_array));
                     } else if let (DataType::Struct(_), DataType::Struct(_)) =
                         (existing_field.data_type(), target_field.data_type())
                     {
@@ -619,65 +848,17 @@ impl ConvertWriterExec {
 
     /// Create a null array of the specified type and length
     fn create_null_array(data_type: &DataType, length: usize) -> Result<ArrayRef> {
-        match data_type {
-            DataType::Boolean => {
-                let mut builder = BooleanBuilder::new();
-                for _ in 0..length {
-                    builder.append_null();
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            DataType::Int64 => {
-                let mut builder = Int64Builder::new();
-                for _ in 0..length {
-                    builder.append_null();
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            DataType::UInt64 => {
-                let mut builder = UInt64Builder::new();
-                for _ in 0..length {
-                    builder.append_null();
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            DataType::Float64 => {
-                let mut builder = Float64Builder::new();
-                for _ in 0..length {
-                    builder.append_null();
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            DataType::Utf8 => {
-                let mut builder = StringBuilder::new();
-                for _ in 0..length {
-                    builder.append_null();
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            DataType::List(_) | DataType::Struct(_) => {
-                // For complex types, fall back to string array with nulls
-                let mut builder = StringBuilder::new();
-                for _ in 0..length {
-                    builder.append_null();
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-            _ => {
-                // For any other types, fall back to string array with nulls
-                let mut builder = StringBuilder::new();
-                for _ in 0..length {
-                    builder.append_null();
-                }
-                Ok(Arc::new(builder.finish()))
-            }
-        }
+        Ok(new_null_array(data_type, length))
     }
 
     /// Static utility function for resolving type conflicts between two DataTypes
     /// This provides reusable conflict resolution logic used by both JsonColumnProcessor and merge operations
     fn resolve_type_conflict_static(type1: &DataType, type2: &DataType) -> Result<DataType> {
         use DataType::*;
+
+        if is_variant_struct_type(type1) || is_variant_struct_type(type2) {
+            return Ok(variant_struct_type());
+        }
 
         match (type1, type2) {
             // If one is null, use the other
@@ -692,7 +873,7 @@ impl ConvertWriterExec {
                 // prefer the specific type
                 match (field1.data_type(), field2.data_type()) {
                     (Utf8, other) | (other, Utf8) if other != &Utf8 => {
-                        Ok(List(Arc::new(Field::new("item", other.clone(), true))))
+                        Ok(List(Arc::new(field_for_type("item", other.clone(), true))))
                     }
                     _ => {
                         // Recursively resolve the item types
@@ -700,7 +881,11 @@ impl ConvertWriterExec {
                             field1.data_type(),
                             field2.data_type(),
                         )?;
-                        Ok(List(Arc::new(Field::new("item", resolved_item_type, true))))
+                        Ok(List(Arc::new(field_for_type(
+                            "item",
+                            resolved_item_type,
+                            true,
+                        ))))
                     }
                 }
             }
@@ -722,7 +907,7 @@ impl ConvertWriterExec {
                                 existing_field.data_type(),
                                 field.data_type(),
                             )?;
-                            let merged_field = Field::new(field.name(), resolved_type, true);
+                            let merged_field = field_for_type(field.name(), resolved_type, true);
                             merged_fields.insert(field.name().clone(), merged_field);
                         }
                         None => {
@@ -738,13 +923,12 @@ impl ConvertWriterExec {
 
                 Ok(Struct(fields.into()))
             }
-            // If types are incompatible, fall back to string representation
+            // If types are incompatible, fall back to variant
             _ => {
                 if type1 == type2 {
                     Ok(type1.clone())
                 } else {
-                    // When types conflict, use Utf8 as a safe fallback
-                    Ok(Utf8)
+                    Ok(variant_struct_type())
                 }
             }
         }
@@ -881,7 +1065,7 @@ impl JsonColumnProcessor {
     pub fn get_inferred_schema(&self) -> Schema {
         let mut fields = Vec::new();
         for (name, data_type) in &self.field_schemas {
-            fields.push(Field::new(name, data_type.clone(), true));
+            fields.push(field_for_type(name, data_type.clone(), true));
         }
         fields.sort_unstable_by(|a, b| a.name().cmp(b.name()));
         Schema::new(fields)
@@ -912,7 +1096,7 @@ impl JsonColumnProcessor {
                     .map(|field| field.as_ref().clone())
                     .collect::<Vec<_>>(),
             ),
-            other => Schema::new(vec![Field::new("value", other, true)]),
+            other => Schema::new(vec![field_for_type("value", other, true)]),
         }
     }
 
@@ -926,7 +1110,7 @@ impl JsonColumnProcessor {
                 let arr = value.as_array().unwrap();
                 if arr.is_empty() {
                     // Empty array - we'll use Utf8 as default item type
-                    Ok(DataType::List(Arc::new(Field::new(
+                    Ok(DataType::List(Arc::new(field_for_type(
                         "item",
                         DataType::Utf8,
                         true,
@@ -934,7 +1118,7 @@ impl JsonColumnProcessor {
                 } else {
                     // Process ALL array elements to infer unified item type
                     let unified_item_type = self.infer_unified_array_item_type(arr)?;
-                    Ok(DataType::List(Arc::new(Field::new(
+                    Ok(DataType::List(Arc::new(field_for_type(
                         "item",
                         unified_item_type,
                         true,
@@ -946,7 +1130,7 @@ impl JsonColumnProcessor {
                 let mut struct_fields = Vec::new();
                 for (key, val) in obj.iter() {
                     let field_type = self.infer_from_json_value(val)?;
-                    struct_fields.push(Field::new(key, field_type, true));
+                    struct_fields.push(field_for_type(key, field_type, true));
                 }
                 struct_fields.sort_unstable_by(|a, b| a.name().cmp(b.name()));
                 Ok(DataType::Struct(struct_fields.into()))
@@ -975,6 +1159,10 @@ impl JsonColumnProcessor {
     fn resolve_type_conflict(&self, type1: &DataType, type2: &DataType) -> Result<DataType> {
         use DataType::*;
 
+        if is_variant_struct_type(type1) || is_variant_struct_type(type2) {
+            return Ok(variant_struct_type());
+        }
+
         match (type1, type2) {
             // If one is null, use the other
             (Null, other) | (other, Null) => Ok(other.clone()),
@@ -988,13 +1176,17 @@ impl JsonColumnProcessor {
                 // prefer the specific type
                 match (field1.data_type(), field2.data_type()) {
                     (Utf8, other) | (other, Utf8) if other != &Utf8 => {
-                        Ok(List(Arc::new(Field::new("item", other.clone(), true))))
+                        Ok(List(Arc::new(field_for_type("item", other.clone(), true))))
                     }
                     _ => {
                         // Recursively resolve the item types
                         let resolved_item_type =
                             self.resolve_type_conflict(field1.data_type(), field2.data_type())?;
-                        Ok(List(Arc::new(Field::new("item", resolved_item_type, true))))
+                        Ok(List(Arc::new(field_for_type(
+                            "item",
+                            resolved_item_type,
+                            true,
+                        ))))
                     }
                 }
             }
@@ -1016,7 +1208,7 @@ impl JsonColumnProcessor {
                                 existing_field.data_type(),
                                 field.data_type(),
                             )?;
-                            let merged_field = Field::new(field.name(), resolved_type, true);
+                            let merged_field = field_for_type(field.name(), resolved_type, true);
                             merged_fields.insert(field.name().clone(), merged_field);
                         }
                         None => {
@@ -1032,13 +1224,12 @@ impl JsonColumnProcessor {
 
                 Ok(Struct(fields.into()))
             }
-            // If types are incompatible, fall back to string representation
+            // If types are incompatible, fall back to variant
             _ => {
                 if type1 == type2 {
                     Ok(type1.clone())
                 } else {
-                    // When types conflict, use Utf8 as a safe fallback
-                    Ok(Utf8)
+                    Ok(variant_struct_type())
                 }
             }
         }
@@ -1093,8 +1284,7 @@ impl JsonColumnProcessor {
             // All elements are complex types (lists, etc.) - try to merge
             self.resolve_complex_array_type(&other_types)
         } else {
-            // Mixed types - fall back to string representation
-            Ok(DataType::Utf8)
+            Ok(variant_struct_type())
         }
     }
 
@@ -1127,7 +1317,7 @@ impl JsonColumnProcessor {
         // Build Arrow struct fields - all fields are nullable
         let mut struct_fields = Vec::new();
         for (field_name, data_type) in unified_fields {
-            struct_fields.push(Field::new(&field_name, data_type, true));
+            struct_fields.push(field_for_type(&field_name, data_type, true));
         }
 
         struct_fields.sort_unstable_by(|a, b| a.name().cmp(b.name()));
@@ -1166,7 +1356,7 @@ impl JsonColumnProcessor {
         if list_item_types.len() == types.len() {
             // All are List types - merge the item types
             if list_item_types.is_empty() {
-                Ok(DataType::List(Arc::new(Field::new(
+                Ok(DataType::List(Arc::new(field_for_type(
                     "item",
                     DataType::Utf8,
                     true,
@@ -1177,7 +1367,7 @@ impl JsonColumnProcessor {
                 for item_type in list_item_types.iter().skip(1) {
                     common_item_type = self.resolve_type_conflict(&common_item_type, item_type)?;
                 }
-                Ok(DataType::List(Arc::new(Field::new(
+                Ok(DataType::List(Arc::new(field_for_type(
                     "item",
                     common_item_type,
                     true,
@@ -1189,9 +1379,7 @@ impl JsonColumnProcessor {
             if types.iter().all(|t| t == first_type) {
                 Ok(first_type.clone())
             } else {
-                // Complex type merging would be very sophisticated
-                // For now, fall back to string
-                Ok(DataType::Utf8)
+                Ok(variant_struct_type())
             }
         }
     }
@@ -1221,7 +1409,21 @@ impl JsonColumnProcessor {
     }
 
     /// Convert JSON values to a single structural Arrow array (replacement approach)
+    #[cfg(test)]
     pub fn convert_to_structural_array(&self) -> Result<(DataType, ArrayRef)> {
+        self.convert_to_structural_array_internal(false)
+    }
+
+    /// Convert JSON values to a structural Arrow array, preserving the root struct even if
+    /// there is only one top-level field.
+    pub fn convert_to_structural_array_preserve_root(&self) -> Result<(DataType, ArrayRef)> {
+        self.convert_to_structural_array_internal(true)
+    }
+
+    fn convert_to_structural_array_internal(
+        &self,
+        preserve_root_struct: bool,
+    ) -> Result<(DataType, ArrayRef)> {
         if self.parsed_values.is_empty() {
             return Ok((DataType::Null, Arc::new(NullArray::new(0))));
         }
@@ -1234,8 +1436,8 @@ impl JsonColumnProcessor {
             return Ok((DataType::Null, Arc::new(NullArray::new(self.row_count))));
         }
 
-        // If there's only one field, return that field's type and array directly
-        if inferred_schema.fields().len() == 1 {
+        // If there's only one field, return that field directly unless we're preserving root
+        if inferred_schema.fields().len() == 1 && !preserve_root_struct {
             let field = &inferred_schema.fields()[0];
             let array = self.create_arrow_array_for_field(field.name(), field.data_type())?;
             return Ok((field.data_type().clone(), array));
@@ -1286,7 +1488,22 @@ impl JsonColumnProcessor {
     /// schema-driven approach that handles arbitrary nesting levels.
     /// Universal array builder factory - creates Arrow builders for any DataType recursively
     fn create_array_builder_for_type(data_type: &DataType) -> Result<Box<dyn ArrayBuilder>> {
+        if is_variant_struct_type(data_type) {
+            return Ok(Box::new(VariantArrayBuilderAdapter::new(0)));
+        }
+
         match data_type {
+            DataType::List(field) => {
+                let values = Self::create_array_builder_for_type(field.data_type())?;
+                Ok(Box::new(ListBuilder::new(values).with_field(field.clone())))
+            }
+            DataType::Struct(fields) => {
+                let mut field_builders = Vec::with_capacity(fields.len());
+                for field in fields.iter() {
+                    field_builders.push(Self::create_array_builder_for_type(field.data_type())?);
+                }
+                Ok(Box::new(StructBuilder::new(fields.clone(), field_builders)))
+            }
             DataType::Boolean
             | DataType::Int8
             | DataType::Int16
@@ -1299,8 +1516,6 @@ impl JsonColumnProcessor {
             | DataType::Float32
             | DataType::Float64
             | DataType::Utf8
-            | DataType::List(_)
-            | DataType::Struct(_)
             | DataType::Null => Ok(make_builder(data_type, 0)),
             _ => Err(datafusion_common::DataFusionError::NotImplemented(format!(
                 "Array builder for type {data_type:?} not yet implemented"
@@ -1314,6 +1529,19 @@ impl JsonColumnProcessor {
         json_value: Option<&OwnedValue>,
         data_type: &DataType,
     ) -> Result<()> {
+        if is_variant_struct_type(data_type) {
+            if let Some(variant_builder) = builder
+                .as_any_mut()
+                .downcast_mut::<VariantArrayBuilderAdapter>()
+            {
+                variant_builder.append_json_value(json_value)?;
+                return Ok(());
+            }
+            return Err(datafusion_common::DataFusionError::Internal(
+                "Builder type mismatch for Variant".to_string(),
+            ));
+        }
+
         match (data_type, json_value) {
             // Handle primitive types
             (DataType::Boolean, Some(OwnedValue::Static(simd_json::StaticNode::Bool(b)))) => {
@@ -1605,6 +1833,19 @@ impl JsonColumnProcessor {
         json_value: Option<&OwnedValue>,
         data_type: &DataType,
     ) -> Result<()> {
+        if is_variant_struct_type(data_type) {
+            if let Some(variant_builder) =
+                struct_builder.field_builder::<VariantArrayBuilderAdapter>(field_index)
+            {
+                variant_builder.append_json_value(json_value)?;
+            } else {
+                return Err(datafusion_common::DataFusionError::Internal(
+                    "Builder type mismatch for Variant".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
         match data_type {
             DataType::Boolean => {
                 if let Some(bool_builder) =
@@ -1860,6 +2101,20 @@ impl JsonColumnProcessor {
 
     /// Helper to append null values to any builder type
     fn append_null_to_builder(builder: &mut dyn ArrayBuilder, data_type: &DataType) -> Result<()> {
+        if is_variant_struct_type(data_type) {
+            if let Some(variant_builder) = builder
+                .as_any_mut()
+                .downcast_mut::<VariantArrayBuilderAdapter>()
+            {
+                variant_builder.append_null();
+            } else {
+                return Err(datafusion_common::DataFusionError::Internal(
+                    "Builder type mismatch for Variant".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
         match data_type {
             DataType::Boolean => {
                 if let Some(bool_builder) = builder.as_any_mut().downcast_mut::<BooleanBuilder>() {
@@ -2004,6 +2259,9 @@ impl JsonColumnProcessor {
 }
 
 fn json_value_matches_type(value: &OwnedValue, data_type: &DataType) -> bool {
+    if is_variant_struct_type(data_type) {
+        return true;
+    }
     match data_type {
         DataType::Struct(_) => matches!(value, OwnedValue::Object(_)),
         DataType::List(_) => matches!(value, OwnedValue::Array(_)),
@@ -2032,10 +2290,15 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{Int64Array, NullArray, StringArray};
+    use arrow::compute::CastOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::{MemTable, TableProvider};
+    use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::variant::{
+        GetOptions, VariantArrayBuilder, VariantBuilderExt, VariantPath, variant_get,
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -2301,6 +2564,68 @@ mod tests {
     }
 
     #[test]
+    fn test_variant_parquet_roundtrip_and_variant_get() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let file_path = temp_dir.path().join("variant.parquet");
+
+        let mut variant_builder = VariantArrayBuilder::new(2);
+        {
+            let mut object_builder = variant_builder.new_object();
+            let mut nested_builder = object_builder.new_object("a");
+            nested_builder.insert("x", 1i64);
+            nested_builder.finish();
+            object_builder.finish();
+        }
+        {
+            let mut object_builder = variant_builder.new_object();
+            object_builder.insert("a", 42i64);
+            object_builder.finish();
+        }
+        let variant_array = variant_builder.build();
+        let field = variant_array.field("data");
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![ArrayRef::from(variant_array)]).unwrap();
+
+        let file = std::fs::File::create(&file_path).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("arrow writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let file = std::fs::File::open(&file_path).expect("open parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("reader builder")
+            .build()
+            .expect("build reader");
+        let read_batch = reader.next().expect("batch").expect("read batch");
+        let data_array = read_batch.column(0);
+
+        let nested_field = Field::new("x", DataType::Int64, true);
+        let nested_options = GetOptions::new_with_path(VariantPath::from("a.x"))
+            .with_as_type(Some(Arc::new(nested_field)))
+            .with_cast_options(CastOptions::default());
+        let nested_result = variant_get(data_array, nested_options).expect("variant_get nested");
+        let nested_array = nested_result
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("nested int64");
+        assert_eq!(nested_array.value(0), 1);
+        assert!(nested_array.is_null(1));
+
+        let int_field = Field::new("a", DataType::Int64, true);
+        let int_options = GetOptions::new_with_path(VariantPath::from("a"))
+            .with_as_type(Some(Arc::new(int_field)))
+            .with_cast_options(CastOptions::default());
+        let int_result = variant_get(data_array, int_options).expect("variant_get int64");
+        let int_array = int_result
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 result");
+        assert!(int_array.is_null(0));
+        assert_eq!(int_array.value(1), 42);
+    }
+
+    #[test]
     fn test_json_schema_inferrer_array_of_structs_different_schemas() -> Result<()> {
         let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
 
@@ -2354,12 +2679,10 @@ mod tests {
 
         let inferred_schema = processor.get_inferred_schema();
 
-        // Construct exact expected schema with type conflict resolution
+        // Construct exact expected schema with variant conflict resolution
         let struct_with_conflict_type = DataType::Struct(
             vec![
-                // Type conflict between Int64 and Utf8 resolves to Utf8
-                // All fields are nullable in simplified inference
-                Field::new("age", DataType::Utf8, true), // conflicts resolved to Utf8
+                super::field_for_type("age", super::variant_struct_type(), true),
                 Field::new("name", DataType::Utf8, true),
             ]
             .into(),
@@ -2501,8 +2824,12 @@ mod tests {
 
         let inferred_schema = processor.get_inferred_schema();
 
-        // Mixed primitives should fall back to string
-        let mixed_array_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        // Mixed primitives should resolve to variant
+        let mixed_array_type = DataType::List(Arc::new(super::field_for_type(
+            "item",
+            super::variant_struct_type(),
+            true,
+        )));
 
         let expected_schema = Schema::new(vec![Field::new("value", mixed_array_type, true)]);
 
@@ -2894,6 +3221,33 @@ mod tests {
             .downcast_ref::<NullArray>()
             .expect("Expected NullArray");
         assert_eq!(null_array.len(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_preserve_root_struct_for_single_field() -> Result<()> {
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 2, Vec::new());
+
+        let json_objects = vec![r#"{"a": 1}"#, r#"{"a": 2}"#];
+
+        for (i, json_str) in json_objects.iter().enumerate() {
+            processor.process_json_string(i, json_str)?;
+        }
+
+        let (data_type, array) = processor.convert_to_structural_array_preserve_root()?;
+
+        let expected_struct_type =
+            DataType::Struct(vec![Field::new("a", DataType::Int64, true)].into());
+        assert_eq!(
+            data_type, expected_struct_type,
+            "Expected root struct to be preserved"
+        );
+        assert_eq!(array.len(), 2);
+        assert!(
+            array.as_any().is::<StructArray>(),
+            "Expected StructArray for preserved root"
+        );
 
         Ok(())
     }

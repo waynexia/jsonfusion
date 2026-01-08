@@ -3,8 +3,9 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
-    StructArray,
+    StructArray, new_null_array,
 };
+use arrow::compute::CastOptions;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::functions::core;
 use datafusion_common::config::ConfigOptions;
@@ -17,10 +18,12 @@ use datafusion_expr::{
     ColumnarValue, Documentation, Expr, Literal, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
     ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
+use parquet::variant::{GetOptions, VariantArray, VariantPath, variant_get};
+use serde_json::Value;
 use simd_json::OwnedValue;
 use simd_json::prelude::*;
 
-use crate::json_display::array_value_to_json_string;
+use crate::json_display::{array_value_to_json_string, json_value_from_variant};
 
 static GET_FIELD_TYPED: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     let inner = core::get_field();
@@ -100,6 +103,14 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
 
         match &args.args[0] {
             ColumnarValue::Array(array) => {
+                if let Some(variant_array) = try_variant_array(array) {
+                    if json_default {
+                        let json_array = json_strings_from_variant_array(&variant_array, &path)?;
+                        return Ok(ColumnarValue::Array(json_array));
+                    }
+                    let result_array = variant_get_array(array, &path, target_type)?;
+                    return Ok(ColumnarValue::Array(result_array));
+                }
                 if array.is_empty() {
                     let values = null_scalar.to_array_of_size(0)?;
                     return Ok(ColumnarValue::Array(values));
@@ -121,6 +132,18 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
             }
             ColumnarValue::Scalar(scalar) => {
                 let array = scalar.to_array()?;
+                if let Some(variant_array) = try_variant_array(&array) {
+                    if json_default {
+                        let json_array = json_strings_from_variant_array(&variant_array, &path)?;
+                        let scalar = ScalarValue::try_from_array(json_array.as_ref(), 0)
+                            .unwrap_or_else(|_| null_scalar.clone());
+                        return Ok(ColumnarValue::Scalar(scalar));
+                    }
+                    let result_array = variant_get_array(&array, &path, target_type)?;
+                    let scalar = ScalarValue::try_from_array(result_array.as_ref(), 0)
+                        .unwrap_or_else(|_| null_scalar.clone());
+                    return Ok(ColumnarValue::Scalar(scalar));
+                }
                 let scalar = scalar_from_array_value(
                     &array,
                     0,
@@ -202,6 +225,75 @@ fn path_from_arg(arg: &ColumnarValue) -> Result<String> {
         | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(path))) => Ok(path.clone()),
         ColumnarValue::Scalar(_) => internal_err!("get_field_typed expects a string path"),
         ColumnarValue::Array(_) => internal_err!("get_field_typed expects a literal path"),
+    }
+}
+
+fn try_variant_array(array: &ArrayRef) -> Option<VariantArray> {
+    VariantArray::try_new(array.as_ref()).ok()
+}
+
+fn is_empty_json_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(values) => values.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+fn json_string_from_variant(variant: parquet::variant::Variant<'_, '_>) -> Result<Option<String>> {
+    let json_value = json_value_from_variant(variant)?;
+    if is_empty_json_value(&json_value) {
+        return Ok(None);
+    }
+    let json_string = serde_json::to_string(&json_value).map_err(|e| {
+        datafusion_common::DataFusionError::Execution(format!(
+            "Failed to serialize variant JSON: {e}"
+        ))
+    })?;
+    Ok(Some(json_string))
+}
+
+fn json_strings_from_variant_array(variant_array: &VariantArray, path: &str) -> Result<ArrayRef> {
+    let variant_path = if path.is_empty() {
+        None
+    } else {
+        Some(VariantPath::from(path))
+    };
+    let mut values = Vec::with_capacity(variant_array.len());
+    for i in 0..variant_array.len() {
+        if variant_array.is_null(i) {
+            values.push(None);
+            continue;
+        }
+        let variant = variant_array.value(i);
+        let extracted = if let Some(path) = &variant_path {
+            let Some(extracted) = variant.get_path(path) else {
+                values.push(None);
+                continue;
+            };
+            extracted
+        } else {
+            variant
+        };
+        values.push(json_string_from_variant(extracted)?);
+    }
+    Ok(Arc::new(StringArray::from(values)))
+}
+
+fn variant_get_array(array: &ArrayRef, path: &str, target_type: &DataType) -> Result<ArrayRef> {
+    let mut options = if path.is_empty() {
+        GetOptions::new()
+    } else {
+        GetOptions::new_with_path(VariantPath::from(path))
+    };
+    let field = Arc::new(Field::new("value", target_type.clone(), true));
+    options = options
+        .with_as_type(Some(field))
+        .with_cast_options(CastOptions::default());
+    match variant_get(array, options) {
+        Ok(result) => Ok(result),
+        Err(_) => Ok(new_null_array(target_type, array.len())),
     }
 }
 
@@ -382,6 +474,11 @@ fn json_string_from_struct_array(
     let mut remaining = segments;
 
     while let Some((head, tail)) = remaining.split_first() {
+        if let Some(variant_array) = try_variant_array(&current_array) {
+            let json_array = json_strings_from_variant_array(&variant_array, &remaining.join("."))?;
+            return json_string_from_array(&json_array, index);
+        }
+
         let Some(struct_array) = current_array.as_any().downcast_ref::<StructArray>() else {
             return Ok(None);
         };
@@ -399,6 +496,11 @@ fn json_string_from_struct_array(
 
         current_array = struct_array.column(field_index).clone();
         remaining = tail;
+    }
+
+    if let Some(variant_array) = try_variant_array(&current_array) {
+        let json_array = json_strings_from_variant_array(&variant_array, "")?;
+        return json_string_from_array(&json_array, index);
     }
 
     let json_string = match current_array.data_type() {
@@ -471,6 +573,16 @@ fn scalar_from_struct_array(
     let mut remaining = segments;
 
     while let Some((head, tail)) = remaining.split_first() {
+        if try_variant_array(&current_array).is_some() {
+            let path = remaining.join(".");
+            let result_array = variant_get_array(&current_array, &path, target_type)
+                .unwrap_or_else(|_| new_null_array(target_type, current_array.len()));
+            let Ok(value) = ScalarValue::try_from_array(result_array.as_ref(), index) else {
+                return null_scalar.clone();
+            };
+            return cast_scalar_value(&value, target_type, null_scalar);
+        }
+
         let Some(struct_array) = current_array.as_any().downcast_ref::<StructArray>() else {
             return null_scalar.clone();
         };
@@ -488,6 +600,15 @@ fn scalar_from_struct_array(
 
         current_array = struct_array.column(field_index).clone();
         remaining = tail;
+    }
+
+    if try_variant_array(&current_array).is_some() {
+        let result_array = variant_get_array(&current_array, "", target_type)
+            .unwrap_or_else(|_| new_null_array(target_type, current_array.len()));
+        let Ok(value) = ScalarValue::try_from_array(result_array.as_ref(), index) else {
+            return null_scalar.clone();
+        };
+        return cast_scalar_value(&value, target_type, null_scalar);
     }
 
     cast_scalar_from_array(&current_array, index, target_type, null_scalar)
@@ -684,6 +805,7 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_common::config::ConfigOptions;
     use datafusion_expr::ScalarFunctionArgs;
+    use parquet::variant::{VariantArrayBuilder, VariantBuilderExt};
 
     use super::*;
 
@@ -846,6 +968,76 @@ mod tests {
             serde_json::Value::String("alice@example.com".to_string())
         );
         assert!(string_array.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_invocation_variant_extracts_typed_and_json() -> Result<()> {
+        let mut variant_builder = VariantArrayBuilder::new(2);
+        {
+            let mut object_builder = variant_builder.new_object();
+            let mut nested_builder = object_builder.new_object("a");
+            nested_builder.insert("x", 1i64);
+            nested_builder.finish();
+            object_builder.finish();
+        }
+        {
+            let mut object_builder = variant_builder.new_object();
+            object_builder.insert("a", 42i64);
+            object_builder.finish();
+        }
+        let variant_array = ArrayRef::from(variant_builder.build());
+
+        let args = build_args(
+            ColumnarValue::Array(variant_array.clone()),
+            "a.x",
+            DataType::Int64,
+        );
+        let value = GET_FIELD_TYPED.inner().invoke_with_args(args)?;
+        let ColumnarValue::Array(array) = value else {
+            panic!("expected array result");
+        };
+        let int_array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(int_array.value(0), 1);
+        assert!(int_array.is_null(1));
+
+        let args = build_unknown_args(ColumnarValue::Array(variant_array), "a");
+        let value = GET_FIELD_TYPED.inner().invoke_with_args(args)?;
+        let ColumnarValue::Array(array) = value else {
+            panic!("expected array result");
+        };
+        let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(string_array.value(0)).unwrap();
+        assert_eq!(parsed, serde_json::json!({"x": 1}));
+        let parsed: serde_json::Value = serde_json::from_str(string_array.value(1)).unwrap();
+        assert_eq!(parsed, serde_json::json!(42));
+        Ok(())
+    }
+
+    #[test]
+    fn test_invocation_struct_with_variant_path() -> Result<()> {
+        let mut variant_builder = VariantArrayBuilder::new(2);
+        {
+            let mut object_builder = variant_builder.new_object();
+            object_builder.insert("x", 1i64);
+            object_builder.finish();
+        }
+        variant_builder.append_value(42i64);
+        let variant_array = variant_builder.build();
+
+        let struct_array: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(variant_array.field("a")),
+            ArrayRef::from(variant_array),
+        )]));
+
+        let args = build_args(ColumnarValue::Array(struct_array), "a.x", DataType::Int64);
+        let value = GET_FIELD_TYPED.inner().invoke_with_args(args)?;
+        let ColumnarValue::Array(array) = value else {
+            panic!("expected array result");
+        };
+        let int_array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(int_array.value(0), 1);
+        assert!(int_array.is_null(1));
         Ok(())
     }
 }
