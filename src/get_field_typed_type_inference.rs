@@ -20,6 +20,10 @@ use datafusion_expr::{
 };
 
 use crate::get_field_typed::get_field_typed;
+use crate::jsonfusion_hints::{
+    JSONFUSION_HINTS_KEY, JSONFUSION_METADATA_KEY, JsonFusionPathHint, decode_jsonfusion_hints,
+    specs_to_hints,
+};
 
 #[derive(Debug, Default)]
 pub struct GetFieldTypedTypeInferenceRule;
@@ -27,6 +31,36 @@ pub struct GetFieldTypedTypeInferenceRule;
 impl GetFieldTypedTypeInferenceRule {
     pub fn new() -> Self {
         Self
+    }
+
+    fn apply_jsonfusion_hint_strategy(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+        plan.transform_up_with_subqueries(|plan| {
+            let name_preserver = NamePreserver::new(&plan);
+            let schema = expr_schema_for_plan(&plan).clone();
+            plan.map_expressions(|expr| {
+                let saved = name_preserver.save(&expr);
+                let transformed = expr.transform_up(|expr| match expr {
+                    Expr::ScalarFunction(fun)
+                        if fun.name() == "get_field_typed" && fun.args.len() == 2 =>
+                    {
+                        let hint_type = hint_type_for_jsonfusion_path(&fun, &schema)?;
+                        if let Some(hint_type) = hint_type {
+                            let (expr, changed) =
+                                add_type_hint(Expr::ScalarFunction(fun), &hint_type)?;
+                            if changed {
+                                Ok(Transformed::yes(expr))
+                            } else {
+                                Ok(Transformed::no(expr))
+                            }
+                        } else {
+                            Ok(Transformed::no(Expr::ScalarFunction(fun)))
+                        }
+                    }
+                    other => Ok(Transformed::no(other)),
+                })?;
+                Ok(transformed.update_data(|expr| saved.restore(expr)))
+            })
+        })
     }
 
     fn apply_cast_strategy(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
@@ -234,6 +268,7 @@ impl AnalyzerRule for GetFieldTypedTypeInferenceRule {
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         let transformed = Self::apply_column_strategy(plan)?;
+        let transformed = Self::apply_jsonfusion_hint_strategy(transformed.data)?;
         let transformed = Self::apply_cast_strategy(transformed.data)?;
         let transformed = Self::apply_signature_strategy(transformed.data)?;
         let transformed = Self::apply_type_coercion_strategy(transformed.data)?;
@@ -244,7 +279,7 @@ impl AnalyzerRule for GetFieldTypedTypeInferenceRule {
 fn is_jsonfusion_field(field: &Field) -> bool {
     field
         .metadata()
-        .get("JSONFUSION")
+        .get(JSONFUSION_METADATA_KEY)
         .map(|value| value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -287,6 +322,51 @@ impl GetFieldTypedTypeInferenceRule {
             })
         })
     }
+}
+
+fn hint_type_for_jsonfusion_path(
+    fun: &datafusion_expr::expr::ScalarFunction,
+    schema: &DFSchemaRef,
+) -> Result<Option<DataType>> {
+    let Some(column) = column_from_expr(&fun.args[0]) else {
+        return Ok(None);
+    };
+    let Some(path) = path_from_expr(&fun.args[1]) else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(None);
+    }
+
+    let field = ExprSchema::field_from_column(schema.as_ref(), &column)
+        .or_else(|_| schema.field_with_unqualified_name(&column.name))
+        .ok();
+    let Some(field) = field else {
+        return Ok(None);
+    };
+    if !is_jsonfusion_field(field) {
+        return Ok(None);
+    }
+    let Some(encoded) = field.metadata().get(JSONFUSION_HINTS_KEY) else {
+        return Ok(None);
+    };
+    let specs = decode_jsonfusion_hints(encoded)?;
+    let hints = specs_to_hints(&specs)?;
+    let segments: Vec<String> = path.split('.').map(|segment| segment.to_string()).collect();
+    let Some(hint_type) = hint_type_from_path(&hints, &segments) else {
+        return Ok(None);
+    };
+    if matches!(hint_type, DataType::Null) {
+        return Ok(None);
+    }
+    Ok(Some(hint_type))
+}
+
+fn hint_type_from_path(hints: &[JsonFusionPathHint], path: &[String]) -> Option<DataType> {
+    hints
+        .iter()
+        .find(|hint| hint.path == path)
+        .map(|hint| hint.data_type.clone())
 }
 
 fn add_type_hint(expr: Expr, hint_type: &DataType) -> Result<(Expr, bool)> {
@@ -994,6 +1074,27 @@ fn unwrap_alias_expr(expr: &Expr) -> &Expr {
     }
 }
 
+fn column_from_expr(expr: &Expr) -> Option<Column> {
+    match expr {
+        Expr::Column(column) => Some(column.clone()),
+        Expr::Alias(alias) => column_from_expr(&alias.expr),
+        _ => None,
+    }
+}
+
+fn path_from_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(path))
+            | ScalarValue::LargeUtf8(Some(path))
+            | ScalarValue::Utf8View(Some(path)),
+            _,
+        ) => Some(path.clone()),
+        Expr::Alias(alias) => path_from_expr(&alias.expr),
+        _ => None,
+    }
+}
+
 fn candidate_types_for_signature(
     signature: &TypeSignature,
     arg_count: usize,
@@ -1192,6 +1293,10 @@ mod tests {
 
     use super::GetFieldTypedTypeInferenceRule;
     use crate::get_field_typed::get_field_typed;
+    use crate::jsonfusion_hints::{
+        JSONFUSION_HINTS_KEY, JSONFUSION_METADATA_KEY, JsonFusionPathHintSpec,
+        encode_jsonfusion_hints,
+    };
 
     fn struct_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
@@ -1394,6 +1499,45 @@ mod tests {
             other => panic!("unexpected type hint expr: {other:?}"),
         };
         assert_eq!(hint_type, DataType::Utf8View);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_jsonfusion_hint_sets_get_field_typed_type_hint() -> datafusion_common::Result<()>
+    {
+        let ctx = SessionContext::new();
+
+        let hints = vec![JsonFusionPathHintSpec {
+            path: "a".to_string(),
+            sql_type: "BIGINT".to_string(),
+            nullable: true,
+        }];
+        let encoded = encode_jsonfusion_hints(&hints)?.expect("hints should encode");
+        let mut metadata = HashMap::new();
+        metadata.insert(JSONFUSION_METADATA_KEY.to_string(), "true".to_string());
+        metadata.insert(JSONFUSION_HINTS_KEY.to_string(), encoded);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("j", DataType::Utf8, true).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::new_empty(schema.clone());
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("t", Arc::new(table))?;
+
+        let df = ctx.table("t").await?;
+        let expr = get_field_typed(col("j"), "a", None);
+        let plan = df.select(vec![expr])?.logical_plan().clone();
+
+        let rule = GetFieldTypedTypeInferenceRule::new();
+        let analyzed = rule.analyze(plan, &ConfigOptions::new())?;
+
+        let LogicalPlan::Projection(p) = analyzed else {
+            panic!("expected projection");
+        };
+        let args = get_field_typed_args(&p.expr[0]);
+        assert_eq!(args.len(), 3);
+        assert_eq!(hint_data_type(args), DataType::Int64);
+
         Ok(())
     }
 
