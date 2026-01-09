@@ -24,4 +24,6 @@ url = "2.5.4"
 uuid = { version = "1.18.0", features = ["v7", "serde"] }
 
 [dev-dependencies]
+sqlness = { version = "0.6.1", features = ["postgres"] }
 tempfile = "3.0"
+tokio-postgres = "0.7.15"

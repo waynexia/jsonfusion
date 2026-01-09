@@ -1,0 +1,17 @@
+-- Explicit get_field_typed usage
+CREATE TABLE explicit_demo (id INT, data JSONFUSION);
+
+(Empty response)
+
+INSERT INTO explicit_demo VALUES (1, '{"name":"Ada","age":39}');
+
+(Empty response)
+
+SELECT
+  get_field_typed(data, 'name') AS name_json,
+  get_field_typed(data, 'age', CAST(NULL AS INT)) AS age_typed
+FROM explicit_demo;
+
+name_json	age_typed
+"Ada"	39
+

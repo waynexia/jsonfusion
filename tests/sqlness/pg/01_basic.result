@@ -1,0 +1,26 @@
+-- Basic JSONFUSION insert and query
+CREATE TABLE users (id INT, data JSONFUSION);
+
+(Empty response)
+
+INSERT INTO users VALUES
+  (1, '{"name":"Ada","age":39,"active":true,"meta":{"city":"NY"}}'),
+  (2, '{"name":"Bob","age":40,"active":false,"meta":{"city":"SF"}}'),
+  (3, '{"name":"Eve"}');
+
+(Empty response)
+
+SELECT id, data FROM users ORDER BY id;
+
+id	data
+1	{"active":true,"age":39,"meta":{"city":"NY"},"name":"Ada"}
+2	{"active":false,"age":40,"meta":{"city":"SF"},"name":"Bob"}
+3	{"name":"Eve"}
+
+SELECT data.name AS name, data.meta.city AS city FROM users ORDER BY id;
+
+name	city
+"Ada"	"NY"
+"Bob"	"SF"
+"Eve"	NULL
+

@@ -88,6 +88,7 @@ async fn main() -> Result<(), std::io::Error> {
 
     // Register json_display UDF
     session_context.register_udf(json_display::json_display_udf());
+    session_context.register_udf(get_field_typed::get_field_typed_udf());
 
     // Start the Postgres compatible server with SSL/TLS
     let server_options = ServerOptions::new()

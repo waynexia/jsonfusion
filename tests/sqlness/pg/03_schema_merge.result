@@ -1,0 +1,25 @@
+-- Schema merging across inserts
+CREATE TABLE merge_demo (id INT, data JSONFUSION);
+
+(Empty response)
+
+INSERT INTO merge_demo VALUES (1, '{"a":1}');
+
+(Empty response)
+
+INSERT INTO merge_demo VALUES (2, '{"b":"two"}');
+
+(Empty response)
+
+SELECT id, json_display(data) AS data FROM merge_demo ORDER BY id;
+
+id	data
+1	{"a":1}
+2	{"b":"two"}
+
+SELECT data.a AS a, data.b AS b FROM merge_demo ORDER BY id;
+
+a	b
+1	NULL
+NULL	"two"
+

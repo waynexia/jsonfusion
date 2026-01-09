@@ -1,0 +1,20 @@
+-- JSONFUSION type hints and usage
+CREATE TABLE typed (id INT, data JSONFUSION (age INT NOT NULL, active BOOLEAN));
+
+(Empty response)
+
+INSERT INTO typed VALUES (1, '{"age":21,"active":true}');
+
+(Empty response)
+
+INSERT INTO typed VALUES (2, '{"age":"nope","active":"yes"}');
+
+Failed to execute query, encountered: Error { kind: Db, cause: Some(DbError { severity: "ERROR", parsed_severity: None, code: SqlState(EXX000), message: "Execution error: JSONFusion column 'data' has type mismatch at 'age': expected Int32", detail: None, hint: None, position: None, where_: None, schema: None, table: None, column: None, datatype: None, constraint: None, file: None, line: None, routine: None }) }
+
+SELECT data.age + 1 AS age_plus_one,
+       CASE WHEN data.active THEN 1 ELSE 0 END AS active_flag
+FROM typed;
+
+age_plus_one	active_flag
+22	1
+

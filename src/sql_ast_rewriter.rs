@@ -1,9 +1,10 @@
-use arrow::datatypes::Field;
+use arrow::datatypes::{DataType, Field};
 use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, TableReference};
 use datafusion_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
-use datafusion_expr::{Expr, GetFieldAccess};
+use datafusion_expr::{Cast, Expr, GetFieldAccess};
 
 use crate::get_field_typed::get_field_typed;
+use crate::jsonfusion_hints::{JSONFUSION_HINTS_KEY, decode_jsonfusion_hints, specs_to_hints};
 
 /// Rewrites SQL field access (e.g. `data.a.b`) on JSONFusion columns into
 /// `get_field_typed(column, 'a.b')` calls so planning does not depend on the path
@@ -61,6 +62,39 @@ impl JsonFusionExprPlanner {
     }
 }
 
+fn hint_expr_for_path(field: &Field, path: &str) -> Result<Option<Expr>> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let Some(encoded) = field.metadata().get(JSONFUSION_HINTS_KEY) else {
+        return Ok(None);
+    };
+    let specs = decode_jsonfusion_hints(encoded)?;
+    let hints = specs_to_hints(&specs)?;
+    let segments: Vec<String> = path.split('.').map(|segment| segment.to_string()).collect();
+    let Some(hint_type) = hints
+        .iter()
+        .find(|hint| hint.path == segments)
+        .map(|hint| hint.data_type.clone())
+    else {
+        return Ok(None);
+    };
+    if matches!(hint_type, DataType::Null) {
+        return Ok(None);
+    }
+    Ok(Some(type_hint_expr(&hint_type)))
+}
+
+fn type_hint_expr(data_type: &DataType) -> Expr {
+    match ScalarValue::try_new_null(data_type) {
+        Ok(value) => Expr::Literal(value, None),
+        Err(_) => Expr::Cast(Cast::new(
+            Box::new(Expr::Literal(ScalarValue::Null, None)),
+            data_type.clone(),
+        )),
+    }
+}
+
 impl ExprPlanner for JsonFusionExprPlanner {
     fn plan_compound_identifier(
         &self,
@@ -74,7 +108,8 @@ impl ExprPlanner for JsonFusionExprPlanner {
 
         let path = nested_names.join(".");
         let column = Column::from((qualifier, field));
-        let rewritten = get_field_typed(Expr::Column(column), path, None);
+        let hint_expr = hint_expr_for_path(field, &path)?;
+        let rewritten = get_field_typed(Expr::Column(column), path, hint_expr);
         Ok(PlannerResult::Planned(rewritten))
     }
 
@@ -118,7 +153,14 @@ impl ExprPlanner for JsonFusionExprPlanner {
         }
         path.push_str(&segment);
 
-        let rewritten = get_field_typed(Expr::Column(column), path, None);
+        let field = ExprSchema::field_from_column(schema, &column)
+            .or_else(|_| schema.field_with_unqualified_name(&column.name))
+            .ok();
+        let hint_expr = match field {
+            Some(field) => hint_expr_for_path(field, &path)?,
+            None => None,
+        };
+        let rewritten = get_field_typed(Expr::Column(column), path, hint_expr);
         Ok(PlannerResult::Planned(rewritten))
     }
 }

@@ -32,6 +32,10 @@ static GET_FIELD_TYPED: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| {
     )))
 });
 
+pub fn get_field_typed_udf() -> ScalarUDF {
+    GET_FIELD_TYPED.as_ref().clone()
+}
+
 pub fn get_field_typed(arg1: Expr, arg2: impl Literal, arg3: Option<Expr>) -> Expr {
     let mut args = vec![arg1, arg2.lit()];
     if let Some(arg3) = arg3 {
