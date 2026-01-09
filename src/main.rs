@@ -20,6 +20,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_pg_catalog::pg_catalog::context::EmptyContextProvider;
 use datafusion_postgres::auth::AuthManager;
@@ -55,29 +56,6 @@ async fn main() -> Result<(), std::io::Error> {
         .with_information_schema(true)
         .with_default_catalog_and_schema("jsonfusion", "public")
         .with_create_default_catalog_and_schema(false);
-    config.options_mut().optimizer.repartition_file_scans = match std::env::var(
-        "JSONFUSION_REPARTITION_FILE_SCANS",
-    ) {
-        Ok(value) => match value.as_str() {
-            "1" | "true" | "TRUE" => true,
-            "0" | "false" | "FALSE" => false,
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "invalid JSONFUSION_REPARTITION_FILE_SCANS {value:?} (expected 0/1/false/true)"
-                    ),
-                ));
-            }
-        },
-        Err(_) => {
-            // JSONFusion tables often contain wide Parquet files with a small number of row groups.
-            // DataFusion's file scan repartitioning can split a single file into many ranges,
-            // causing repeated Parquet metadata reads while only one partition actually scans
-            // the row group. Disable within-file repartitioning by default to reduce that overhead.
-            false
-        }
-    };
     config
         .options_mut()
         .execution
@@ -104,6 +82,16 @@ async fn main() -> Result<(), std::io::Error> {
     }
 
     // Create a SessionState using the config and runtime_env
+    let mut physical_optimizer_rules = PhysicalOptimizer::default().rules;
+    let enforce_distribution_idx = physical_optimizer_rules
+        .iter()
+        .position(|rule| rule.name() == "EnforceDistribution")
+        .unwrap_or(physical_optimizer_rules.len());
+    physical_optimizer_rules.insert(
+        enforce_distribution_idx,
+        Arc::new(jsonfusion_physical_optimizer::JsonFusionPruneParquetSchemaRule::new()),
+    );
+
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime_env)
@@ -119,9 +107,7 @@ async fn main() -> Result<(), std::io::Error> {
             Arc::new(ResolveGroupingFunction::new()),
             Arc::new(TypeCoercion::new()),
         ])
-        .with_physical_optimizer_rule(Arc::new(
-            jsonfusion_physical_optimizer::JsonFusionPruneParquetSchemaRule::new(),
-        ))
+        .with_physical_optimizer_rules(physical_optimizer_rules)
         .build();
 
     // Create a SessionContext

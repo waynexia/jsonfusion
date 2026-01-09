@@ -37,9 +37,6 @@ impl PhysicalOptimizerRule for JsonFusionPruneParquetSchemaRule {
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let debug = debug_enabled();
-        if !pruning_enabled() {
-            return Ok(plan);
-        }
 
         let mut data_source_execs = Vec::new();
         collect_data_source_execs(&plan, &mut data_source_execs);
@@ -93,24 +90,10 @@ impl PhysicalOptimizerRule for JsonFusionPruneParquetSchemaRule {
     }
 }
 
-fn pruning_enabled() -> bool {
-    match std::env::var("JSONFUSION_PRUNE_PARQUET_SCHEMA") {
-        Ok(value) => !matches!(value.as_str(), "0" | "false" | "FALSE"),
-        Err(_) => true,
-    }
-}
-
 fn debug_enabled() -> bool {
     match std::env::var("JSONFUSION_DEBUG_PRUNE_PARQUET_SCHEMA") {
         Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
         Err(_) => false,
-    }
-}
-
-fn leaf_projection_enabled() -> bool {
-    match std::env::var("JSONFUSION_PARQUET_LEAF_PROJECTION") {
-        Ok(value) => !matches!(value.as_str(), "0" | "false" | "FALSE"),
-        Err(_) => true,
     }
 }
 
@@ -305,6 +288,7 @@ fn collect_physical_exprs(
             | "SortPreservingMergeExec"
             | "ProjectionExec"
             | "FilterExec"
+            | "OutputRequirementExec"
             | "EmptyExec"
     ) {
         return collect_children_exprs(plan, out);
@@ -349,11 +333,9 @@ fn rewrite_plan_with_pruned_scan(
     }
 
     let pruned = prune_file_schema(file_scan.file_schema(), requirements)?;
-    if Arc::ptr_eq(&pruned, file_scan.file_schema()) {
-        return Ok(plan);
-    }
+    let schema_changed = !Arc::ptr_eq(&pruned, file_scan.file_schema());
 
-    if debug_enabled() {
+    if debug_enabled() && schema_changed {
         for column in requirements.keys() {
             let Ok(old_field) = file_scan.file_schema().field_with_name(column) else {
                 continue;
@@ -370,30 +352,55 @@ fn rewrite_plan_with_pruned_scan(
     }
 
     let mut updated_scan = file_scan.clone();
-    updated_scan.table_schema = TableSchema::new(
-        Arc::clone(&pruned),
-        file_scan.table_partition_cols().clone(),
-    );
-    if leaf_projection_enabled()
-        && file_scan.file_source.filter().is_none()
-        && file_scan
+    if schema_changed {
+        updated_scan.table_schema = TableSchema::new(
+            Arc::clone(&pruned),
+            file_scan.table_partition_cols().clone(),
+        );
+    }
+
+    let should_swap_to_leaf_source = updated_scan.file_source.filter().is_none()
+        && updated_scan
             .file_source
             .as_any()
             .downcast_ref::<JsonFusionParquetLeafProjectionSource>()
             .is_none()
-        && let Some(parquet_source) = file_scan
+        && updated_scan
             .file_source
             .as_any()
             .downcast_ref::<ParquetSource>()
-    {
-        let mut leaf_source: Arc<dyn FileSource> = Arc::new(
-            JsonFusionParquetLeafProjectionSource::from_parquet_source(parquet_source),
-        );
-        leaf_source = leaf_source
-            .with_statistics(datafusion_common::Statistics::new_unknown(pruned.as_ref()));
-        leaf_source = leaf_source.with_schema(updated_scan.table_schema.clone());
-        updated_scan.file_source = leaf_source;
+            .is_some();
+
+    if !schema_changed && !should_swap_to_leaf_source {
+        return Ok(plan);
     }
+
+    let scan_statistics = updated_scan
+        .file_source
+        .statistics()
+        .unwrap_or_else(|_| datafusion_common::Statistics::new_unknown(pruned.as_ref()));
+
+    let mut updated_source = updated_scan
+        .file_source
+        .with_statistics(scan_statistics.clone())
+        .with_schema(updated_scan.table_schema.clone());
+
+    if should_swap_to_leaf_source
+        && let Some(parquet_source) = updated_source.as_any().downcast_ref::<ParquetSource>()
+    {
+        let statistics = if schema_changed {
+            datafusion_common::Statistics::new_unknown(pruned.as_ref())
+        } else {
+            scan_statistics
+        };
+        updated_source = Arc::new(JsonFusionParquetLeafProjectionSource::from_parquet_source(
+            parquet_source,
+        ))
+        .with_statistics(statistics)
+        .with_schema(updated_scan.table_schema.clone());
+    }
+
+    updated_scan.file_source = updated_source;
 
     let updated_exec = scan
         .clone()

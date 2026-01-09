@@ -7,10 +7,12 @@ use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::datasource::listing::{FileRange, PartitionedFile};
 use datafusion::datasource::physical_plan::parquet::DefaultParquetFileReaderFactory;
 use datafusion::datasource::physical_plan::{
-    FileOpenFuture, FileOpener, FileScanConfig, FileSource, ParquetFileReaderFactory, ParquetSource,
+    FileGroup, FileOpenFuture, FileOpener, FileScanConfig, FileSource, ParquetFileReaderFactory,
+    ParquetSource,
 };
 use datafusion::datasource::schema_adapter::{DefaultSchemaAdapterFactory, SchemaAdapterFactory};
 use datafusion::datasource::table_schema::TableSchema;
+use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_common::{DataFusionError, Result, Statistics};
 use futures::TryStreamExt;
@@ -142,6 +144,66 @@ impl FileSource for JsonFusionParquetLeafProjectionSource {
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         self.schema_adapter_factory.clone()
     }
+
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        repartition_file_min_size: usize,
+        output_ordering: Option<LexOrdering>,
+        config: &FileScanConfig,
+    ) -> Result<Option<FileScanConfig>> {
+        if config.file_compression_type.is_compressed() || config.new_lines_in_values {
+            return Ok(None);
+        }
+
+        if output_ordering.is_some() {
+            return Ok(None);
+        }
+
+        let has_ranges = config
+            .file_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .any(|file| file.range.is_some());
+        if has_ranges {
+            return Ok(None);
+        }
+
+        let mut files = config
+            .file_groups
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect::<Vec<_>>();
+        if files.len() <= 1 {
+            return Ok(None);
+        }
+
+        let total_size = files.iter().map(|file| file.object_meta.size).sum::<u64>();
+        if total_size == 0 || total_size < repartition_file_min_size as u64 {
+            return Ok(None);
+        }
+
+        let partitions = target_partitions.min(files.len());
+        let mut file_groups = (0..partitions)
+            .map(|_| FileGroup::new(Vec::new()))
+            .collect::<Vec<_>>();
+        let mut group_sizes = vec![0u64; partitions];
+
+        for file in files.drain(..) {
+            let next_partition = group_sizes
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, size)| *size)
+                .map(|(idx, _)| idx)
+                .expect("partitions is non-empty");
+            group_sizes[next_partition] += file.object_meta.size;
+            file_groups[next_partition].push(file);
+        }
+
+        let mut source = config.clone();
+        source.file_groups = file_groups;
+        Ok(Some(source))
+    }
 }
 
 #[derive(Debug)]
@@ -206,8 +268,7 @@ impl FileOpener for JsonFusionParquetLeafProjectionOpener {
                 physical_file_schema.as_ref(),
                 projected_schema.as_ref(),
                 &adapted_projections,
-            )
-            .unwrap_or_else(|| ProjectionMask::roots(parquet_schema, adapted_projections));
+            );
 
             builder = builder.with_projection(mask).with_batch_size(batch_size);
             if let Some(limit) = limit {
@@ -247,20 +308,20 @@ fn build_leaf_projection_mask(
     physical_file_schema: &Schema,
     projected_schema: &Schema,
     adapted_projections: &[usize],
-) -> Option<ProjectionMask> {
-    let mut leaf_paths = Vec::new();
+) -> ProjectionMask {
+    let mut leaf_specs = Vec::new();
     for field in projected_schema.fields().iter() {
         let prefix = field.name().to_string();
-        if !collect_leaf_paths(field, prefix, &mut leaf_paths) {
-            return None;
-        }
+        collect_leaf_specs(field, prefix, &mut leaf_specs);
     }
 
     let mut path_to_leaf_idx = HashMap::<String, usize>::new();
     let mut root_to_first_leaf = HashMap::<String, usize>::new();
+    let mut column_paths = Vec::with_capacity(parquet_schema.columns().len());
     for (leaf_idx, col) in parquet_schema.columns().iter().enumerate() {
         let parts = col.path().parts();
         let path = parts.join(".");
+        column_paths.push(path.clone());
         path_to_leaf_idx.insert(path.clone(), leaf_idx);
         if let Some(root) = parts.first() {
             root_to_first_leaf.entry(root.clone()).or_insert(leaf_idx);
@@ -268,9 +329,21 @@ fn build_leaf_projection_mask(
     }
 
     let mut leaf_indices = Vec::new();
-    for path in leaf_paths {
-        if let Some(idx) = path_to_leaf_idx.get(&path) {
-            leaf_indices.push(*idx);
+    for spec in leaf_specs {
+        match spec {
+            LeafSpec::Exact(path) => {
+                if let Some(idx) = path_to_leaf_idx.get(&path) {
+                    leaf_indices.push(*idx);
+                }
+            }
+            LeafSpec::Prefix(prefix) => {
+                let dot_prefix = format!("{prefix}.");
+                for (leaf_idx, path) in column_paths.iter().enumerate() {
+                    if path == &prefix || path.starts_with(&dot_prefix) {
+                        leaf_indices.push(leaf_idx);
+                    }
+                }
+            }
         }
     }
 
@@ -296,27 +369,29 @@ fn build_leaf_projection_mask(
 
     leaf_indices.sort_unstable();
     leaf_indices.dedup();
-    Some(ProjectionMask::leaves(parquet_schema, leaf_indices))
+    ProjectionMask::leaves(parquet_schema, leaf_indices)
 }
 
-fn collect_leaf_paths(field: &FieldRef, prefix: String, out: &mut Vec<String>) -> bool {
+#[derive(Debug)]
+enum LeafSpec {
+    Exact(String),
+    Prefix(String),
+}
+
+fn collect_leaf_specs(field: &FieldRef, prefix: String, out: &mut Vec<LeafSpec>) {
     match field.data_type() {
         DataType::Struct(fields) => {
             for child in fields.iter() {
                 let next = format!("{prefix}.{}", child.name());
-                if !collect_leaf_paths(child, next, out) {
-                    return false;
-                }
+                collect_leaf_specs(child, next, out);
             }
-            true
         }
         DataType::List(_)
         | DataType::LargeList(_)
         | DataType::FixedSizeList(_, _)
-        | DataType::Map(_, _) => false,
+        | DataType::Map(_, _) => out.push(LeafSpec::Prefix(prefix)),
         _ => {
-            out.push(prefix);
-            true
+            out.push(LeafSpec::Exact(prefix));
         }
     }
 }
