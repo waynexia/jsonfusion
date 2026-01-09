@@ -7,6 +7,26 @@ use datafusion_expr::{ColumnarValue, ScalarUDF, Signature, SimpleScalarUDF, Vola
 use parquet::variant::{Variant, VariantArray};
 use serde_json::{Map, Value};
 
+fn needs_json_string_escaping(value: &str) -> bool {
+    value
+        .bytes()
+        .any(|byte| matches!(byte, b'"' | b'\\' | 0x00..=0x1f))
+}
+
+fn json_quote_str(value: &str) -> Result<String> {
+    if needs_json_string_escaping(value) {
+        return serde_json::to_string(value).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to serialize JSON string: {e}"))
+        });
+    }
+
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    out.push_str(value);
+    out.push('"');
+    Ok(out)
+}
+
 /// Creates a `json_display` scalar UDF that converts complex Arrow types to JSON strings
 pub fn json_display_udf() -> ScalarUDF {
     let json_display_impl = Arc::new(|args: &[ColumnarValue]| -> Result<ColumnarValue> {
@@ -57,6 +77,55 @@ pub(crate) fn array_to_json_strings(array: &ArrayRef) -> Result<ArrayRef> {
         return Ok(Arc::new(string_array));
     }
 
+    match array.data_type() {
+        DataType::Utf8 => {
+            let values = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let mut json_strings = Vec::with_capacity(values.len());
+            for i in 0..values.len() {
+                if values.is_null(i) {
+                    json_strings.push(None);
+                    continue;
+                }
+                let json_string = json_quote_str(values.value(i))?;
+                json_strings.push(Some(json_string));
+            }
+            return Ok(Arc::new(StringArray::from_iter(json_strings)));
+        }
+        DataType::LargeUtf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .unwrap();
+            let mut json_strings = Vec::with_capacity(values.len());
+            for i in 0..values.len() {
+                if values.is_null(i) {
+                    json_strings.push(None);
+                    continue;
+                }
+                let json_string = json_quote_str(values.value(i))?;
+                json_strings.push(Some(json_string));
+            }
+            return Ok(Arc::new(StringArray::from_iter(json_strings)));
+        }
+        DataType::Utf8View => {
+            let values = array
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .unwrap();
+            let mut json_strings = Vec::with_capacity(values.len());
+            for i in 0..values.len() {
+                if values.is_null(i) {
+                    json_strings.push(None);
+                    continue;
+                }
+                let json_string = json_quote_str(values.value(i))?;
+                json_strings.push(Some(json_string));
+            }
+            return Ok(Arc::new(StringArray::from_iter(json_strings)));
+        }
+        _ => {}
+    }
+
     let mut json_strings = Vec::with_capacity(array.len());
 
     for i in 0..array.len() {
@@ -93,6 +162,37 @@ pub(crate) fn array_value_to_json_string(array: &ArrayRef, index: usize) -> Resu
         let json_string = serde_json::to_string(&json_value)
             .map_err(|e| DataFusionError::Execution(format!("Failed to serialize JSON: {e}")))?;
         return Ok(Some(json_string));
+    }
+
+    match array.data_type() {
+        DataType::Utf8 => {
+            let values = array.as_any().downcast_ref::<StringArray>().unwrap();
+            if values.is_null(index) {
+                return Ok(None);
+            }
+            return Ok(Some(json_quote_str(values.value(index))?));
+        }
+        DataType::LargeUtf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .unwrap();
+            if values.is_null(index) {
+                return Ok(None);
+            }
+            return Ok(Some(json_quote_str(values.value(index))?));
+        }
+        DataType::Utf8View => {
+            let values = array
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .unwrap();
+            if values.is_null(index) {
+                return Ok(None);
+            }
+            return Ok(Some(json_quote_str(values.value(index))?));
+        }
+        _ => {}
     }
 
     if array.is_null(index) {
@@ -364,6 +464,28 @@ mod tests {
         assert_eq!(string_array.value(0), "true");
         assert_eq!(string_array.value(1), "false");
         assert!(string_array.is_null(2)); // null values are preserved as null
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_json_display_string_escaping() -> Result<()> {
+        let string_array: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("plain"),
+            Some("quote\""),
+            Some("back\\slash"),
+            Some("line\nbreak"),
+            None,
+        ]));
+
+        let json_strings = array_to_json_strings(&string_array)?;
+        let json_strings = json_strings.as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(json_strings.value(0), "\"plain\"");
+        assert_eq!(json_strings.value(1), "\"quote\\\"\"");
+        assert_eq!(json_strings.value(2), "\"back\\\\slash\"");
+        assert_eq!(json_strings.value(3), "\"line\\nbreak\"");
+        assert!(json_strings.is_null(4));
 
         Ok(())
     }
