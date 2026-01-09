@@ -37,11 +37,15 @@ async fn main() -> Result<(), std::io::Error> {
         Arc::new(RwLock::new(HashMap::new()));
 
     // Configure a 4k batch size
-    let config = SessionConfig::new()
+    let mut config = SessionConfig::new()
         .with_batch_size(4 * 1024)
         .with_information_schema(true)
         .with_default_catalog_and_schema("jsonfusion", "public")
         .with_create_default_catalog_and_schema(false);
+    config
+        .options_mut()
+        .execution
+        .skip_physical_aggregate_schema_check = true;
 
     // configure a memory limit of 1GB with 20%  slop
     let runtime_env = RuntimeEnvBuilder::new()
