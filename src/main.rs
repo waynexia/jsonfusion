@@ -95,9 +95,12 @@ async fn main() -> Result<(), std::io::Error> {
         .with_host("127.0.0.1".to_string())
         .with_port(5432);
 
-    let hooks: Vec<Arc<dyn QueryHook>> = vec![Arc::new(
-        jsonfusion_hooks::JsonFusionCreateTableHook::new(jsonfusion_columns.clone()),
-    )];
+    let hooks: Vec<Arc<dyn QueryHook>> = vec![
+        Arc::new(jsonfusion_hooks::JsonFusionCreateTableHook::new(
+            jsonfusion_columns.clone(),
+        )),
+        Arc::new(jsonfusion_hooks::JsonFusionBulkLoadHook::new()),
+    ];
 
     serve_with_hooks(
         session_context,

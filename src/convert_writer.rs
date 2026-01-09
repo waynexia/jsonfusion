@@ -557,7 +557,6 @@ impl ConvertWriterExec {
                     new_fields.push(field_for_type(field.name(), structural_type, true));
                     new_columns.push(structural_array);
                 } else {
-                    println!("[DEBUG] Processor missing for column: {}", field.name());
                     // Fallback: keep original column if processor missing
                     new_fields.push(field.as_ref().clone());
                     new_columns.push(Arc::clone(column));
@@ -568,8 +567,6 @@ impl ConvertWriterExec {
                 new_columns.push(Arc::clone(column));
             }
         }
-
-        println!("[DEBUG] New fields: {new_fields:?}");
 
         // Step 3: Create new RecordBatch with structural replacement
         let new_schema = Arc::new(Schema::new(new_fields));
@@ -662,7 +659,6 @@ impl ConvertWriterExec {
         if let Some(final_schema) = unified_schema.as_ref()
             && let Ok(mut expanded_lock) = self.expanded_schema.write()
         {
-            println!("[DEBUG] Storing expanded schema: {final_schema:?}");
             *expanded_lock = Some(final_schema.clone());
         }
 
@@ -720,6 +716,14 @@ impl ConvertWriterExec {
                         ))
                     })?;
                     target_arrays.push(ArrayRef::from(variant_array));
+                } else if matches!(source_field.data_type(), DataType::Struct(_))
+                    && matches!(target_field.data_type(), DataType::Struct(_))
+                {
+                    let converted_array = Self::convert_struct_array(
+                        source_struct.column(source_field_index),
+                        target_field.data_type(),
+                    )?;
+                    target_arrays.push(converted_array);
                 } else {
                     // Types don't match - create null array for target type
                     let null_array =
@@ -1127,6 +1131,9 @@ impl JsonColumnProcessor {
             }
             ValueType::Object => {
                 let obj = value.as_object().unwrap();
+                if obj.is_empty() {
+                    return Ok(DataType::Null);
+                }
                 let mut struct_fields = Vec::new();
                 for (key, val) in obj.iter() {
                     let field_type = self.infer_from_json_value(val)?;
@@ -1252,9 +1259,13 @@ impl JsonColumnProcessor {
         let mut object_elements = Vec::new();
         let mut primitive_types = Vec::new();
         let mut other_types = Vec::new();
+        let mut has_null = false;
 
         for (element, data_type) in element_types {
             match &data_type {
+                DataType::Null => {
+                    has_null = true;
+                }
                 DataType::Struct(_) => {
                     object_elements.push(element);
                 }
@@ -1268,6 +1279,14 @@ impl JsonColumnProcessor {
         }
 
         // Determine unified type based on element categories
+        if object_elements.is_empty()
+            && primitive_types.is_empty()
+            && other_types.is_empty()
+            && has_null
+        {
+            return Ok(DataType::Null);
+        }
+
         if !object_elements.is_empty() && primitive_types.is_empty() && other_types.is_empty() {
             // All elements are objects - merge their schemas
             self.merge_object_schemas_from_array(&object_elements)
@@ -2289,7 +2308,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{Int64Array, NullArray, StringArray};
+    use arrow::array::{ArrayRef, Int64Array, NullArray, StringArray, StructArray};
     use arrow::compute::CastOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -2920,6 +2939,146 @@ mod tests {
             inferred_schema, expected_schema,
             "Schema mismatch. Expected: {expected_schema:#?}, Got: {inferred_schema:#?}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_object_infers_null_type() -> Result<()> {
+        let mut processor = JsonColumnProcessor::new("test_column".to_string(), 1, Vec::new());
+        let json_str = r#"{"meta": {}}"#;
+        processor.process_json_string(0, json_str)?;
+
+        let inferred_schema = processor.get_inferred_schema();
+        let field = inferred_schema.field_with_name("meta")?;
+        assert_eq!(field.data_type(), &DataType::Null);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_field_populated_for_nested_object() -> Result<()> {
+        let json_str = r#"{"did":"did:plc:yj3sjq3blzpynh27cumnp5ks","time_us":1732206349000167,"kind":"commit","commit":{"rev":"3lbhtytnn2k2f","operation":"create","collection":"app.bsky.feed.post","rkey":"3lbhtyteurk2y","record":{"$type":"app.bsky.feed.post","createdAt":"2024-11-21T16:09:27.095Z","langs":["en"],"reply":{"parent":{"cid":"bafyreibfglofvqou2yiqvwzk4rcgkhhxrbunyemshdjledgwymimqkg24e","uri":"at://did:plc:6tr6tuzlx2db3rduzr2d6r24/app.bsky.feed.post/3lbhqo2rtys2z"},"root":{"cid":"bafyreibfglofvqou2yiqvwzk4rcgkhhxrbunyemshdjledgwymimqkg24e","uri":"at://did:plc:6tr6tuzlx2db3rduzr2d6r24/app.bsky.feed.post/3lbhqo2rtys2z"}},"text":"aaaaah.  LIght shines in a corner of WTF...."},"cid":"bafyreidblutgvj75o4q4akzyyejedjj6l3it6hgqwee6jpwv2wqph5fsgm"}}"#;
+        let mut processor = JsonColumnProcessor::new("data".to_string(), 1, Vec::new());
+        processor.process_json_string(0, json_str)?;
+
+        let Some(parsed) = processor.parsed_values[0].as_ref() else {
+            return Err(datafusion_common::DataFusionError::Execution(
+                "Parsed JSON value missing".to_string(),
+            ));
+        };
+
+        let Some(root) = parsed.as_object() else {
+            return Err(datafusion_common::DataFusionError::Execution(
+                "Parsed JSON root is not an object".to_string(),
+            ));
+        };
+
+        assert!(root.get("commit").is_some());
+
+        let (data_type, array) = processor.convert_to_structural_array_preserve_root()?;
+        let DataType::Struct(fields) = data_type else {
+            return Err(datafusion_common::DataFusionError::Execution(
+                "Expected struct type for parsed JSON".to_string(),
+            ));
+        };
+        let Some(commit_index) = fields.iter().position(|field| field.name() == "commit") else {
+            return Err(datafusion_common::DataFusionError::Execution(
+                "Commit field missing from inferred schema".to_string(),
+            ));
+        };
+        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let commit_array = struct_array.column(commit_index);
+        assert!(!commit_array.is_null(0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_struct_array_recursively_preserves_nested_fields() -> Result<()> {
+        let record_source_type =
+            DataType::Struct(vec![Field::new("text", DataType::Utf8, true)].into());
+        let record_source_field = Arc::new(Field::new("record", record_source_type.clone(), true));
+        let record_source_array = StructArray::from(vec![(
+            Arc::new(Field::new("text", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("hello")])) as ArrayRef,
+        )]);
+
+        let commit_source_type = DataType::Struct(
+            vec![
+                Field::new("rev", DataType::Utf8, true),
+                Field::new("record", record_source_type, true),
+            ]
+            .into(),
+        );
+        let commit_source_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("rev", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec![Some("r1")])) as ArrayRef,
+            ),
+            (
+                Arc::clone(&record_source_field),
+                Arc::new(record_source_array) as ArrayRef,
+            ),
+        ]);
+
+        let data_source_array = StructArray::from(vec![
+            (
+                Arc::new(Field::new("commit", commit_source_type.clone(), true)),
+                Arc::new(commit_source_array) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("did", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec![Some("did:1")])) as ArrayRef,
+            ),
+        ]);
+
+        let target_record_type = DataType::Struct(
+            vec![
+                Field::new(
+                    "langs",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+                Field::new("text", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+        let target_commit_type = DataType::Struct(
+            vec![
+                Field::new("record", target_record_type, true),
+                Field::new("rev", DataType::Utf8, true),
+                Field::new("rkey", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+        let target_data_type = DataType::Struct(
+            vec![
+                Field::new("commit", target_commit_type, true),
+                Field::new("did", DataType::Utf8, true),
+            ]
+            .into(),
+        );
+
+        let converted = ConvertWriterExec::convert_struct_array(
+            &(Arc::new(data_source_array) as ArrayRef),
+            &target_data_type,
+        )?;
+        let converted_struct = converted.as_any().downcast_ref::<StructArray>().unwrap();
+        let commit_array = converted_struct.column_by_name("commit").unwrap();
+        assert!(!commit_array.is_null(0));
+
+        let commit_struct = commit_array.as_any().downcast_ref::<StructArray>().unwrap();
+        let record_array = commit_struct.column_by_name("record").unwrap();
+        let record_struct = record_array.as_any().downcast_ref::<StructArray>().unwrap();
+        let text_array = record_struct
+            .column_by_name("text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(text_array.value(0), "hello");
 
         Ok(())
     }
