@@ -2,3 +2,6 @@
 
 # default data path
 jsonfusion/
+
+# jsonbench data path
+data/
