@@ -119,6 +119,18 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
                     let values = null_scalar.to_array_of_size(0)?;
                     return Ok(ColumnarValue::Array(values));
                 }
+                if json_default && let Some(resolved) = resolve_struct_path(array, &segments) {
+                    let mut values = Vec::with_capacity(array.len());
+                    for index in 0..array.len() {
+                        if struct_path_is_null(&resolved.parents, index) {
+                            values.push(None);
+                            continue;
+                        }
+                        let json_string = array_value_to_json_string(&resolved.leaf, index)?;
+                        values.push(json_string);
+                    }
+                    return Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))));
+                }
                 let mut scalars = Vec::with_capacity(array.len());
                 for index in 0..array.len() {
                     let scalar = scalar_from_array_value(
@@ -234,6 +246,38 @@ fn path_from_arg(arg: &ColumnarValue) -> Result<String> {
 
 fn try_variant_array(array: &ArrayRef) -> Option<VariantArray> {
     VariantArray::try_new(array.as_ref()).ok()
+}
+
+struct StructPath {
+    parents: Vec<ArrayRef>,
+    leaf: ArrayRef,
+}
+
+fn resolve_struct_path(array: &ArrayRef, segments: &[&str]) -> Option<StructPath> {
+    let mut current = Arc::clone(array);
+    let mut parents = Vec::with_capacity(segments.len());
+
+    for segment in segments {
+        if try_variant_array(&current).is_some() {
+            return None;
+        }
+        let struct_array = current.as_any().downcast_ref::<StructArray>()?;
+        let DataType::Struct(fields) = current.data_type() else {
+            return None;
+        };
+        let index = fields.iter().position(|field| field.name() == *segment)?;
+        parents.push(Arc::clone(&current));
+        current = struct_array.column(index).clone();
+    }
+
+    Some(StructPath {
+        parents,
+        leaf: current,
+    })
+}
+
+fn struct_path_is_null(parents: &[ArrayRef], index: usize) -> bool {
+    parents.iter().any(|parent| parent.is_null(index))
 }
 
 fn is_empty_json_value(value: &Value) -> bool {
@@ -805,6 +849,7 @@ fn scalar_from_f64(value: f64, target_type: &DataType) -> Option<ScalarValue> {
 #[cfg(test)]
 mod tests {
     use arrow::array::{ArrayRef, Int64Array, StringArray, StructArray};
+    use arrow::buffer::Buffer;
     use arrow::datatypes::{DataType, Field};
     use datafusion_common::ScalarValue;
     use datafusion_common::config::ConfigOptions;
@@ -971,6 +1016,29 @@ mod tests {
             parsed,
             serde_json::Value::String("alice@example.com".to_string())
         );
+        assert!(string_array.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_invocation_defaults_to_json_string_nested_struct_nulls() -> Result<()> {
+        let city_array: ArrayRef = Arc::new(StringArray::from(vec![Some("NY"), Some("SF")]));
+        let meta_array: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("city", DataType::Utf8, true)),
+            city_array,
+        )]));
+        let meta_field = Arc::new(Field::new("meta", meta_array.data_type().clone(), true));
+        let validity = Buffer::from(vec![0b00000001u8]);
+        let outer_array = StructArray::from((vec![(meta_field, meta_array)], validity));
+
+        let args = build_unknown_args(ColumnarValue::Array(Arc::new(outer_array)), "meta.city");
+        let value = GET_FIELD_TYPED.inner().invoke_with_args(args)?;
+        let ColumnarValue::Array(array) = value else {
+            panic!("expected array result");
+        };
+        let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(string_array.value(0)).unwrap();
+        assert_eq!(parsed, serde_json::Value::String("NY".to_string()));
         assert!(string_array.is_null(1));
         Ok(())
     }
