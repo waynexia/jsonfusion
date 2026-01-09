@@ -27,6 +27,7 @@ use datafusion::physical_plan::{
 use datafusion_common::{Result, internal_err};
 use futures::StreamExt;
 use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::variant::{
     BuilderSpecificState, CastOptions as VariantCastOptions, ObjectBuilder, Variant,
@@ -484,6 +485,89 @@ impl ExecutionPlan for ConvertWriterExec {
 }
 
 impl ConvertWriterExec {
+    const DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT: usize = 64 * 1024 * 1024;
+
+    fn parquet_writer_properties() -> WriterProperties {
+        if cfg!(test) {
+            return Self::default_parquet_writer_properties();
+        }
+        Self::parquet_writer_properties_from_env()
+    }
+
+    fn default_parquet_writer_properties() -> WriterProperties {
+        WriterProperties::builder()
+            .set_compression(Self::default_compression())
+            .set_dictionary_page_size_limit(Self::DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT)
+            .build()
+    }
+
+    fn parquet_writer_properties_from_env() -> WriterProperties {
+        let mut builder = WriterProperties::builder();
+        builder = builder.set_compression(Self::compression_from_env());
+        builder = builder.set_dictionary_page_size_limit(Self::DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT);
+
+        if let Some(dictionary_enabled) = std::env::var("JSONFUSION_PARQUET_DICTIONARY_ENABLED")
+            .ok()
+            .and_then(|value| parse_bool_env_var(&value))
+        {
+            builder = builder.set_dictionary_enabled(dictionary_enabled);
+        }
+
+        if let Some(dictionary_page_size_limit) =
+            std::env::var("JSONFUSION_PARQUET_DICTIONARY_PAGE_SIZE_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+        {
+            builder = builder.set_dictionary_page_size_limit(dictionary_page_size_limit);
+        }
+
+        builder.build()
+    }
+
+    fn default_compression() -> Compression {
+        let zstd_level = ZstdLevel::try_new(6).unwrap_or_default();
+        Compression::ZSTD(zstd_level)
+    }
+
+    fn compression_from_env() -> Compression {
+        let Ok(codec) = std::env::var("JSONFUSION_PARQUET_COMPRESSION") else {
+            return Self::default_compression();
+        };
+
+        match codec.trim().to_lowercase().as_str() {
+            "zstd" => {
+                let level = std::env::var("JSONFUSION_PARQUET_ZSTD_LEVEL")
+                    .ok()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .and_then(|level| ZstdLevel::try_new(level).ok())
+                    .unwrap_or_else(|| ZstdLevel::try_new(6).unwrap_or_default());
+                Compression::ZSTD(level)
+            }
+            "snappy" => Compression::SNAPPY,
+            "lz4_raw" => Compression::LZ4_RAW,
+            "lz4" => Compression::LZ4,
+            "gzip" => {
+                let level = std::env::var("JSONFUSION_PARQUET_GZIP_LEVEL")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .and_then(|level| GzipLevel::try_new(level).ok())
+                    .unwrap_or_default();
+                Compression::GZIP(level)
+            }
+            "brotli" => {
+                let level = std::env::var("JSONFUSION_PARQUET_BROTLI_LEVEL")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .and_then(|level| BrotliLevel::try_new(level).ok())
+                    .unwrap_or_default();
+                Compression::BROTLI(level)
+            }
+            "uncompressed" | "none" => Compression::UNCOMPRESSED,
+            _ => Self::default_compression(),
+        }
+    }
+
     /// Get the expanded schema after processing (used by ManifestUpdaterExec)
     #[allow(dead_code)]
     pub fn get_expanded_schema(&self) -> Result<SchemaRef> {
@@ -636,7 +720,7 @@ impl ConvertWriterExec {
         })?;
 
         // Create Parquet writer with the unified expanded schema
-        let props = WriterProperties::builder().build();
+        let props = Self::parquet_writer_properties();
         let mut writer = ArrowWriter::try_new(file, final_schema.clone(), Some(props))
             .map_err(datafusion_common::DataFusionError::from)?;
 
@@ -936,6 +1020,14 @@ impl ConvertWriterExec {
                 }
             }
         }
+    }
+}
+
+fn parse_bool_env_var(value: &str) -> Option<bool> {
+    match value.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -2315,6 +2407,7 @@ mod tests {
     use datafusion::datasource::{MemTable, TableProvider};
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use parquet::variant::{
         GetOptions, VariantArrayBuilder, VariantBuilderExt, VariantPath, variant_get,
     };
@@ -3164,6 +3257,21 @@ mod tests {
             .downcast_ref::<arrow::array::UInt64Array>()
             .expect("Expected UInt64Array");
         assert_eq!(count_array.value(0), 4);
+
+        let parquet_file = std::fs::File::open(&output_path).map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to open parquet file metadata: {e}"
+            ))
+        })?;
+        let metadata_reader = SerializedFileReader::new(parquet_file)
+            .map_err(datafusion_common::DataFusionError::from)?;
+        let row_group = metadata_reader.metadata().row_group(0);
+        for i in 0..row_group.num_columns() {
+            assert!(matches!(
+                row_group.column(i).compression(),
+                parquet::basic::Compression::ZSTD(_)
+            ));
+        }
 
         // Read back the Parquet file and verify structure
         let parquet_file = std::fs::File::open(&output_path).map_err(|e| {
