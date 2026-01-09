@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -19,6 +20,14 @@ struct JsonFusionDatabase {
     connection_task: JoinHandle<()>,
     child: Child,
     _temp_dir: TempDir,
+}
+
+fn pick_unused_local_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("failed to bind to an ephemeral port")
+        .local_addr()
+        .expect("failed to read local addr")
+        .port()
 }
 
 #[async_trait]
@@ -46,8 +55,11 @@ impl EnvController for JsonFusionEnv {
             .tempdir()
             .expect("failed to create sqlness tempdir");
 
+        let port = pick_unused_local_port();
+
         let mut child = Command::new(env!("CARGO_BIN_EXE_jsonfusion"))
             .current_dir(temp_dir.path())
+            .env("JSONFUSION_PORT", port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -55,7 +67,7 @@ impl EnvController for JsonFusionEnv {
 
         let db_config = DatabaseConfigBuilder::default()
             .ip_or_host("127.0.0.1".to_string())
-            .tcp_port(5432)
+            .tcp_port(port)
             .user(Some("postgres".to_string()))
             .pass(None)
             .db_name(Some("postgres".to_string()))

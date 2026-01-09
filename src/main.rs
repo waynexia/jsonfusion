@@ -4,6 +4,8 @@ mod get_field_typed_type_inference;
 mod json_display;
 mod jsonfusion_hints;
 mod jsonfusion_hooks;
+mod jsonfusion_parquet_leaf_projection;
+mod jsonfusion_physical_optimizer;
 mod manifest;
 mod schema;
 mod sql_ast_rewriter;
@@ -29,8 +31,19 @@ use crate::table_provider::JsonFusionCatalogProviderList;
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    // Define hardcoded base directory for JSON files
-    let json_base_dir = PathBuf::from("./jsonfusion");
+    let json_base_dir = std::env::var("JSONFUSION_BASE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./jsonfusion"));
+    let server_host = std::env::var("JSONFUSION_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let server_port = match std::env::var("JSONFUSION_PORT") {
+        Ok(port) => port.parse::<u16>().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid JSONFUSION_PORT {port:?}: {err}"),
+            )
+        })?,
+        Err(_) => 5432,
+    };
 
     // Create shared state for JSONFUSION columns and path hints
     let jsonfusion_columns: Arc<RwLock<jsonfusion_hints::JsonFusionColumnHints>> =
@@ -42,6 +55,29 @@ async fn main() -> Result<(), std::io::Error> {
         .with_information_schema(true)
         .with_default_catalog_and_schema("jsonfusion", "public")
         .with_create_default_catalog_and_schema(false);
+    config.options_mut().optimizer.repartition_file_scans = match std::env::var(
+        "JSONFUSION_REPARTITION_FILE_SCANS",
+    ) {
+        Ok(value) => match value.as_str() {
+            "1" | "true" | "TRUE" => true,
+            "0" | "false" | "FALSE" => false,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid JSONFUSION_REPARTITION_FILE_SCANS {value:?} (expected 0/1/false/true)"
+                    ),
+                ));
+            }
+        },
+        Err(_) => {
+            // JSONFusion tables often contain wide Parquet files with a small number of row groups.
+            // DataFusion's file scan repartitioning can split a single file into many ranges,
+            // causing repeated Parquet metadata reads while only one partition actually scans
+            // the row group. Disable within-file repartitioning by default to reduce that overhead.
+            false
+        }
+    };
     config
         .options_mut()
         .execution
@@ -83,6 +119,9 @@ async fn main() -> Result<(), std::io::Error> {
             Arc::new(ResolveGroupingFunction::new()),
             Arc::new(TypeCoercion::new()),
         ])
+        .with_physical_optimizer_rule(Arc::new(
+            jsonfusion_physical_optimizer::JsonFusionPruneParquetSchemaRule::new(),
+        ))
         .build();
 
     // Create a SessionContext
@@ -96,8 +135,8 @@ async fn main() -> Result<(), std::io::Error> {
 
     // Start the Postgres compatible server with SSL/TLS
     let server_options = ServerOptions::new()
-        .with_host("127.0.0.1".to_string())
-        .with_port(5432);
+        .with_host(server_host)
+        .with_port(server_port);
 
     let hooks: Vec<Arc<dyn QueryHook>> = vec![
         Arc::new(jsonfusion_hooks::JsonFusionCreateTableHook::new(
