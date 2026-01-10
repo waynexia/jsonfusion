@@ -3,8 +3,9 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, StringBuilder,
-    StringViewArray, StructArray, new_null_array,
+    StringViewArray, StructArray, make_array, new_null_array,
 };
+use arrow::buffer::NullBuffer;
 use arrow::compute::CastOptions;
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::functions::core;
@@ -262,6 +263,31 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
                     }
                     return Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))));
                 }
+
+                if !json_default
+                    && !segments.is_empty()
+                    && let Some(resolved) = resolve_struct_path(array, &segments)
+                {
+                    let parents = resolved.parents;
+                    let leaf = resolved.leaf;
+
+                    let result = if try_variant_array(&leaf).is_some() {
+                        variant_get_array(&leaf, "", target_type)?
+                    } else if leaf.data_type() == target_type {
+                        leaf
+                    } else {
+                        arrow::compute::cast_with_options(
+                            &leaf,
+                            target_type,
+                            &CastOptions::default(),
+                        )
+                        .unwrap_or_else(|_| new_null_array(target_type, leaf.len()))
+                    };
+
+                    let result = apply_parent_nulls(result, &parents)?;
+                    return Ok(ColumnarValue::Array(result));
+                }
+
                 let mut scalars = Vec::with_capacity(array.len());
                 for index in 0..array.len() {
                     let scalar = scalar_from_array_value(
@@ -409,6 +435,36 @@ fn resolve_struct_path(array: &ArrayRef, segments: &[&str]) -> Option<StructPath
 
 fn struct_path_is_null(parents: &[ArrayRef], index: usize) -> bool {
     parents.iter().any(|parent| parent.is_null(index))
+}
+
+fn apply_parent_nulls(array: ArrayRef, parents: &[ArrayRef]) -> Result<ArrayRef> {
+    if parents.iter().all(|parent| parent.null_count() == 0) {
+        return Ok(array);
+    }
+
+    let mut nulls: Option<NullBuffer> = array.nulls().cloned();
+    for parent in parents {
+        nulls = NullBuffer::union(nulls.as_ref(), parent.nulls());
+    }
+
+    if nulls
+        .as_ref()
+        .is_some_and(|buffer| buffer.null_count() == 0)
+    {
+        nulls = None;
+    }
+
+    if nulls.is_none() && array.nulls().is_none() {
+        return Ok(array);
+    }
+
+    let data = array.to_data();
+    let data = data
+        .into_builder()
+        .nulls(nulls)
+        .build()
+        .map_err(datafusion_common::DataFusionError::from)?;
+    Ok(make_array(data))
 }
 
 fn is_empty_json_value(value: &Value) -> bool {
@@ -1170,6 +1226,52 @@ mod tests {
         let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(string_array.value(0)).unwrap();
         assert_eq!(parsed, serde_json::Value::String("NY".to_string()));
+        assert!(string_array.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_invocation_struct_typed_extracts_string() -> Result<()> {
+        let email_array: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("alice@example.com"), None]));
+        let struct_array: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("email", DataType::Utf8, true)),
+            email_array,
+        )]));
+
+        let args = build_args(ColumnarValue::Array(struct_array), "email", DataType::Utf8);
+        let value = GET_FIELD_TYPED.inner().invoke_with_args(args)?;
+        let ColumnarValue::Array(array) = value else {
+            panic!("expected array result");
+        };
+        let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(string_array.value(0), "alice@example.com");
+        assert!(string_array.is_null(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_invocation_struct_typed_propagates_parent_nulls() -> Result<()> {
+        let city_array: ArrayRef = Arc::new(StringArray::from(vec![Some("NY"), Some("SF")]));
+        let meta_array: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("city", DataType::Utf8, true)),
+            city_array,
+        )]));
+        let meta_field = Arc::new(Field::new("meta", meta_array.data_type().clone(), true));
+        let validity = Buffer::from(vec![0b00000001u8]);
+        let outer_array = StructArray::from((vec![(meta_field, meta_array)], validity));
+
+        let args = build_args(
+            ColumnarValue::Array(Arc::new(outer_array)),
+            "meta.city",
+            DataType::Utf8,
+        );
+        let value = GET_FIELD_TYPED.inner().invoke_with_args(args)?;
+        let ColumnarValue::Array(array) = value else {
+            panic!("expected array result");
+        };
+        let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(string_array.value(0), "NY");
         assert!(string_array.is_null(1));
         Ok(())
     }

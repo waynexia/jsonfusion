@@ -91,9 +91,9 @@ async fn main() -> Result<(), std::io::Error> {
         RwLock::new(create_table_state::JsonFusionCreateTableState::default()),
     );
 
-    // Configure a 4k batch size
+    // Configure a larger batch size for better OLAP throughput
     let mut config = SessionConfig::new()
-        .with_batch_size(4 * 1024)
+        .with_batch_size(16 * 1024)
         .with_information_schema(true)
         .with_default_catalog_and_schema("jsonfusion", "public")
         .with_create_default_catalog_and_schema(false);
