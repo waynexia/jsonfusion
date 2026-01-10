@@ -25,6 +25,7 @@ use datafusion_common::nested_struct::{cast_column, validate_struct_compatibilit
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Result as DataFusionCommonResult, ScalarValue, plan_err};
 use datafusion_expr::dml::InsertOp;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::convert_writer::ConvertWriterExec;
@@ -520,10 +521,7 @@ impl JsonFusionSchemaProvider {
         let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
             Ok(entries) => entries,
             Err(e) => {
-                eprintln!(
-                    "Warning: Could not read base directory {:?}: {}",
-                    self.base_dir, e
-                );
+                warn!(base_dir = ?self.base_dir, error = %e, "Could not read base directory");
                 return Ok(());
             }
         };
@@ -541,7 +539,7 @@ impl JsonFusionSchemaProvider {
                 Some(name) => match name.to_str() {
                     Some(name_str) => name_str.to_string(),
                     None => {
-                        eprintln!("Warning: Invalid directory name in {entry_path:?}");
+                        warn!(entry_path = ?entry_path, "Invalid directory name");
                         continue;
                     }
                 },
@@ -562,10 +560,14 @@ impl JsonFusionSchemaProvider {
                     let table_arc = Arc::new(table_provider);
                     let mut tables = self.tables.write().unwrap();
                     tables.insert(table_name.clone(), table_arc);
-                    println!("Loaded existing table: {table_name}");
+                    info!(table_name = %table_name, "Loaded existing table");
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load table from {entry_path:?}: {e}");
+                    warn!(
+                        entry_path = ?entry_path,
+                        error = %e,
+                        "Failed to load existing table"
+                    );
                     continue;
                 }
             }
@@ -655,9 +657,13 @@ impl SchemaProvider for JsonFusionSchemaProvider {
             std::thread::spawn(move || {
                 handle.block_on(async move {
                     if let Err(e) = tokio::fs::remove_dir_all(&table_dir).await {
-                        eprintln!("Warning: Failed to remove table directory {table_dir:?}: {e}");
+                        warn!(
+                            table_dir = ?table_dir,
+                            error = %e,
+                            "Failed to remove table directory"
+                        );
                     } else {
-                        println!("Dropped table '{table_name}' and removed directory");
+                        info!(table_name = %table_name, "Dropped table and removed directory");
                     }
                 })
             })
@@ -719,7 +725,7 @@ impl JsonFusionCatalogProvider {
             {
                 json_schema.load_existing_tables().await?;
             } else {
-                eprintln!("Warning: Public schema is not a JsonFusionSchemaProvider");
+                warn!("Public schema is not a JsonFusionSchemaProvider");
             }
         }
         Ok(())
@@ -805,7 +811,7 @@ impl JsonFusionCatalogProviderList {
             {
                 json_catalog.load_existing_tables().await?;
             } else {
-                eprintln!("Warning: jsonfusion catalog is not a JsonFusionCatalogProvider");
+                warn!("jsonfusion catalog is not a JsonFusionCatalogProvider");
             }
         }
         Ok(())

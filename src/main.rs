@@ -7,6 +7,7 @@ mod jsonfusion_hooks;
 mod jsonfusion_parquet_leaf_projection;
 mod jsonfusion_physical_optimizer;
 mod jsonfusion_value_counts_exec;
+mod logging;
 mod manifest;
 mod schema;
 mod sql_ast_rewriter;
@@ -27,12 +28,15 @@ use datafusion_pg_catalog::pg_catalog::context::EmptyContextProvider;
 use datafusion_postgres::auth::AuthManager;
 use datafusion_postgres::{QueryHook, ServerOptions, serve_with_hooks};
 use object_store::local::LocalFileSystem;
+use tracing::warn;
 use url::Url;
 
 use crate::table_provider::JsonFusionCatalogProviderList;
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
+    logging::init_tracing();
+
     let json_base_dir = std::env::var("JSONFUSION_BASE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./jsonfusion"));
@@ -79,7 +83,7 @@ async fn main() -> Result<(), std::io::Error> {
         jsonfusion_columns.clone(),
     ));
     if let Err(e) = catalog_list.load_existing_tables().await {
-        eprintln!("Warning: Failed to load some existing tables: {e}");
+        warn!(error = %e, "Failed to load some existing tables");
     }
 
     // Create a SessionState using the config and runtime_env

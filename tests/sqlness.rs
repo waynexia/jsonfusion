@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Once;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_postgres::{Client, Config as PgConfig, NoTls, SimpleQueryMessage};
+use tracing::error;
 
 struct JsonFusionEnv;
 
@@ -20,6 +22,20 @@ struct JsonFusionDatabase {
     connection_task: JoinHandle<()>,
     child: Child,
     _temp_dir: TempDir,
+}
+
+fn init_tracing() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,jsonfusion=info"));
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_test_writer()
+            .try_init();
+    });
 }
 
 fn pick_unused_local_port() -> u16 {
@@ -50,6 +66,8 @@ impl EnvController for JsonFusionEnv {
     type DB = JsonFusionDatabase;
 
     async fn start(&self, _env: &str, _config: Option<&Path>) -> Self::DB {
+        init_tracing();
+
         let temp_dir = tempfile::Builder::new()
             .prefix("jsonfusion-sqlness")
             .tempdir()
@@ -136,7 +154,7 @@ async fn connect_postgres(
     let (client, connection) = pg_config.connect(NoTls).await?;
     let connection_task = tokio::spawn(async move {
         if let Err(err) = connection.await {
-            eprintln!("sqlness postgres connection error: {err:?}");
+            error!(?err, "sqlness postgres connection error");
         }
     });
 

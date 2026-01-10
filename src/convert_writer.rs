@@ -35,6 +35,7 @@ use parquet::variant::{
 };
 use simd_json::OwnedValue;
 use simd_json::prelude::*;
+use tracing::warn;
 
 use crate::get_field_typed::scalar_from_json_value;
 use crate::jsonfusion_hints::{
@@ -1089,9 +1090,11 @@ impl JsonColumnProcessor {
             Err(e) => {
                 // Store None for parse errors and continue processing
                 self.parsed_values[row_index] = None;
-                eprintln!(
-                    "Warning: Failed to parse JSON in column '{}' at row {}: {}",
-                    self.column_name, row_index, e
+                warn!(
+                    column_name = %self.column_name,
+                    row_index,
+                    error = %e,
+                    "Failed to parse JSON"
                 );
                 Ok(())
             }

@@ -18,6 +18,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_common::ScalarValue;
+use tracing::{Level, debug};
 
 use crate::jsonfusion_parquet_leaf_projection::JsonFusionParquetLeafProjectionSource;
 use crate::jsonfusion_value_counts_exec::JsonFusionValueCountsExec;
@@ -37,43 +38,36 @@ impl PhysicalOptimizerRule for JsonFusionPruneParquetSchemaRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let debug = debug_enabled();
-
         let mut data_source_execs = Vec::new();
         collect_data_source_execs(&plan, &mut data_source_execs);
         if data_source_execs.len() != 1 {
-            if debug {
-                eprintln!(
-                    "jsonfusion_prune_parquet_schema: skip (expected 1 DataSourceExec, got {})",
-                    data_source_execs.len()
-                );
-            }
+            debug!(
+                data_source_execs = data_source_execs.len(),
+                "jsonfusion_prune_parquet_schema: skip (expected 1 DataSourceExec)"
+            );
             return Ok(plan);
         }
 
         let mut exprs = Vec::new();
         if !collect_physical_exprs(&plan, &mut exprs)? {
-            if debug {
-                eprintln!("jsonfusion_prune_parquet_schema: skip (unsupported plan nodes)");
-            }
+            debug!("jsonfusion_prune_parquet_schema: skip (unsupported plan nodes)");
             return Ok(plan);
         }
 
         let requirements = collect_jsonfusion_path_requirements(&exprs);
         if requirements.is_empty() {
-            if debug {
-                eprintln!("jsonfusion_prune_parquet_schema: skip (no prunable paths)");
-            }
+            debug!("jsonfusion_prune_parquet_schema: skip (no prunable paths)");
             return Ok(plan);
         }
 
-        if debug {
+        if tracing::enabled!(Level::DEBUG) {
             for (column, req) in &requirements {
                 let mut paths = Vec::new();
                 collect_paths(&req.root, String::new(), &mut paths);
-                eprintln!(
-                    "jsonfusion_prune_parquet_schema: column={column} paths={}",
-                    paths.join(",")
+                debug!(
+                    column = %column,
+                    paths = %paths.join(","),
+                    "jsonfusion_prune_parquet_schema: requirements"
                 );
             }
         }
@@ -106,8 +100,6 @@ impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let debug = debug_enabled();
-
         if !read_bool_env("JSONFUSION_VALUE_COUNTS_PUSHDOWN", true) {
             return Ok(plan);
         }
@@ -115,26 +107,20 @@ impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
         let mut data_source_execs = Vec::new();
         collect_data_source_execs(&plan, &mut data_source_execs);
         if data_source_execs.len() != 1 {
-            if debug {
-                eprintln!(
-                    "jsonfusion_value_counts_pushdown: skip (expected 1 DataSourceExec, got {})",
-                    data_source_execs.len()
-                );
-            }
+            debug!(
+                data_source_execs = data_source_execs.len(),
+                "jsonfusion_value_counts_pushdown: skip (expected 1 DataSourceExec)"
+            );
             return Ok(plan);
         }
 
         if contains_filter_exec(&plan) {
-            if debug {
-                eprintln!("jsonfusion_value_counts_pushdown: skip (FilterExec present)");
-            }
+            debug!("jsonfusion_value_counts_pushdown: skip (FilterExec present)");
             return Ok(plan);
         }
 
         let Some((root_column, path)) = find_count_star_group_by_get_field_typed(&plan)? else {
-            if debug {
-                eprintln!("jsonfusion_value_counts_pushdown: skip (no matching aggregate)");
-            }
+            debug!("jsonfusion_value_counts_pushdown: skip (no matching aggregate)");
             return Ok(plan);
         };
 
@@ -144,28 +130,20 @@ impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
             .expect("DataSourceExec verified")
             .data_source();
         let Some(file_scan) = scan.as_any().downcast_ref::<FileScanConfig>() else {
-            if debug {
-                eprintln!(
-                    "jsonfusion_value_counts_pushdown: skip (data source is not FileScanConfig)"
-                );
-            }
+            debug!("jsonfusion_value_counts_pushdown: skip (data source is not FileScanConfig)");
             return Ok(plan);
         };
 
         if file_scan.file_source.file_type() != "parquet" {
-            if debug {
-                eprintln!(
-                    "jsonfusion_value_counts_pushdown: skip (file_type={})",
-                    file_scan.file_source.file_type()
-                );
-            }
+            debug!(
+                file_type = file_scan.file_source.file_type(),
+                "jsonfusion_value_counts_pushdown: skip (unsupported file type)"
+            );
             return Ok(plan);
         }
 
         if file_scan.file_source.filter().is_some() {
-            if debug {
-                eprintln!("jsonfusion_value_counts_pushdown: skip (scan has filter)");
-            }
+            debug!("jsonfusion_value_counts_pushdown: skip (scan has filter)");
             return Ok(plan);
         }
 
@@ -180,9 +158,7 @@ impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
         }
 
         if files.iter().any(|file| file.range.is_some()) {
-            if debug {
-                eprintln!("jsonfusion_value_counts_pushdown: skip (file ranges present)");
-            }
+            debug!("jsonfusion_value_counts_pushdown: skip (file ranges present)");
             return Ok(plan);
         }
 
@@ -194,9 +170,7 @@ impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
             path,
         )?;
 
-        if debug {
-            eprintln!("jsonfusion_value_counts_pushdown: applied");
-        }
+        debug!("jsonfusion_value_counts_pushdown: applied");
 
         Ok(Arc::new(exec))
     }
@@ -207,13 +181,6 @@ impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
 
     fn schema_check(&self) -> bool {
         false
-    }
-}
-
-fn debug_enabled() -> bool {
-    match std::env::var("JSONFUSION_DEBUG_PRUNE_PARQUET_SCHEMA") {
-        Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
-        Err(_) => false,
     }
 }
 
@@ -558,7 +525,7 @@ fn rewrite_plan_with_pruned_scan(
     let pruned = prune_file_schema(file_scan.file_schema(), requirements)?;
     let schema_changed = !Arc::ptr_eq(&pruned, file_scan.file_schema());
 
-    if debug_enabled() && schema_changed {
+    if schema_changed && tracing::enabled!(Level::DEBUG) {
         for column in requirements.keys() {
             let Ok(old_field) = file_scan.file_schema().field_with_name(column) else {
                 continue;
@@ -568,8 +535,11 @@ fn rewrite_plan_with_pruned_scan(
             };
             let old_leaves = count_leaf_fields(old_field.data_type());
             let new_leaves = count_leaf_fields(new_field.data_type());
-            eprintln!(
-                "jsonfusion_prune_parquet_schema: pruned {column} leaf_fields {old_leaves} -> {new_leaves}"
+            debug!(
+                column = %column,
+                old_leaves,
+                new_leaves,
+                "jsonfusion_prune_parquet_schema: pruned leaf fields"
             );
         }
     }

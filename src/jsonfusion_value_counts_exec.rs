@@ -36,6 +36,7 @@ use parquet::encodings::rle::RleDecoder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::schema::types::SchemaDescriptor;
 use parquet::util::bit_util::{BitReader, ceil, num_required_bits};
+use tracing::debug;
 
 #[derive(Debug)]
 pub struct JsonFusionValueCountsExec {
@@ -229,13 +230,6 @@ async fn collect_file_value_counts(
     local_filesystem: bool,
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<ValueCounts> {
-    let debug = matches!(
-        std::env::var("JSONFUSION_DEBUG_VALUE_COUNTS_EXEC")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "TRUE")
-    );
-
     let total_start = Instant::now();
     let parquet_file_reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(object_store))
         as Arc<dyn ParquetFileReaderFactory>;
@@ -251,13 +245,12 @@ async fn collect_file_value_counts(
         .await;
 
         if let Ok(Ok(counts)) = join {
-            if debug {
-                eprintln!(
-                    "jsonfusion_value_counts_exec file={} local_page_reader=1 elapsed={:?}",
-                    file_location,
-                    blocking_start.elapsed()
-                );
-            }
+            debug!(
+                file = %file_location,
+                local_page_reader = 1,
+                elapsed = ?blocking_start.elapsed(),
+                "jsonfusion_value_counts_exec"
+            );
             return Ok(counts);
         }
     }
@@ -326,19 +319,17 @@ async fn collect_file_value_counts(
         count_elapsed += count_start.elapsed();
     }
 
-    if debug {
-        eprintln!(
-            "jsonfusion_value_counts_exec file={} rows={} meta={:?} schema={:?} build={:?} decode={:?} count={:?} total={:?}",
-            file_location,
-            num_rows,
-            meta_elapsed,
-            schema_elapsed,
-            build_elapsed,
-            decode_elapsed,
-            count_elapsed,
-            total_start.elapsed(),
-        );
-    }
+    debug!(
+        file = %file_location,
+        rows = num_rows,
+        meta = ?meta_elapsed,
+        schema = ?schema_elapsed,
+        build = ?build_elapsed,
+        decode = ?decode_elapsed,
+        count = ?count_elapsed,
+        total = ?total_start.elapsed(),
+        "jsonfusion_value_counts_exec"
+    );
 
     Ok(counts)
 }
