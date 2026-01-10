@@ -22,16 +22,18 @@ use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use tokio::io::AsyncBufReadExt;
 
 use crate::convert_writer::ConvertWriterExec;
-use crate::jsonfusion_hints::{JsonFusionColumnHints, parse_jsonfusion_type_modifiers};
+use crate::create_table_state::JsonFusionCreateTableState;
+use crate::jsonfusion_hints::parse_jsonfusion_type_modifiers;
+use crate::table_options::JsonFusionTableOptions;
 
 #[derive(Debug)]
 pub struct JsonFusionCreateTableHook {
-    column_hints: Arc<RwLock<JsonFusionColumnHints>>,
+    create_table_state: Arc<RwLock<JsonFusionCreateTableState>>,
 }
 
 impl JsonFusionCreateTableHook {
-    pub fn new(column_hints: Arc<RwLock<JsonFusionColumnHints>>) -> Self {
-        Self { column_hints }
+    pub fn new(create_table_state: Arc<RwLock<JsonFusionCreateTableState>>) -> Self {
+        Self { create_table_state }
     }
 
     fn record_create_table_hints(
@@ -43,6 +45,8 @@ impl JsonFusionCreateTableHook {
             return Ok(());
         };
         let columns = &create_table.columns;
+        let table_options =
+            JsonFusionTableOptions::from_create_table_options(&create_table.table_options)?;
 
         let normalize_idents = session_context
             .state()
@@ -66,8 +70,9 @@ impl JsonFusionCreateTableHook {
             hints.insert(column_name, parsed);
         }
 
-        if let Ok(mut state) = self.column_hints.write() {
-            *state = hints;
+        if let Ok(mut state) = self.create_table_state.write() {
+            state.column_hints = hints;
+            state.table_options = table_options;
         }
 
         Ok(())

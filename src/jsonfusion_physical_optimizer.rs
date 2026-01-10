@@ -85,14 +85,8 @@ impl PhysicalOptimizerRule for JsonFusionPruneParquetSchemaRule {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct JsonFusionValueCountsPushdownRule;
-
-impl JsonFusionValueCountsPushdownRule {
-    pub fn new() -> Self {
-        Self
-    }
-}
+#[derive(Debug, Clone)]
+pub struct JsonFusionValueCountsPushdownRule {}
 
 impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
     fn optimize(
@@ -100,10 +94,6 @@ impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !read_bool_env("JSONFUSION_VALUE_COUNTS_PUSHDOWN", true) {
-            return Ok(plan);
-        }
-
         let mut data_source_execs = Vec::new();
         collect_data_source_execs(&plan, &mut data_source_execs);
         if data_source_execs.len() != 1 {
@@ -181,18 +171,6 @@ impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
 
     fn schema_check(&self) -> bool {
         false
-    }
-}
-
-fn read_bool_env(key: &str, default: bool) -> bool {
-    let Ok(value) = std::env::var(key) else {
-        return default;
-    };
-
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "t" | "yes" | "y" | "on" => true,
-        "0" | "false" | "f" | "no" | "n" | "off" => false,
-        _ => default,
     }
 }
 

@@ -29,11 +29,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::convert_writer::ConvertWriterExec;
+use crate::create_table_state::JsonFusionCreateTableState;
 use crate::jsonfusion_hints::{
-    JSONFUSION_HINTS_KEY, JSONFUSION_METADATA_KEY, JsonFusionColumnHints, apply_hint_to_type,
-    encode_jsonfusion_hints,
+    JSONFUSION_HINTS_KEY, JSONFUSION_METADATA_KEY, apply_hint_to_type, encode_jsonfusion_hints,
 };
 use crate::manifest::{Manifest, ManifestUpdaterExec};
+use crate::table_options::JsonFusionTableOptions;
 
 #[derive(Debug)]
 pub struct JsonTableProvider {
@@ -41,12 +42,18 @@ pub struct JsonTableProvider {
     manifest: Manifest,
     /// The schema that the user provided on the table creation.
     given_schema: ArrowSchemaRef,
+    table_options: JsonFusionTableOptions,
     // showing schema depends on predicate?
 }
 
 impl JsonTableProvider {
-    pub async fn create(base_dir: PathBuf, given_schema: ArrowSchemaRef) -> Result<Self> {
+    pub async fn create(
+        base_dir: PathBuf,
+        given_schema: ArrowSchemaRef,
+        table_options: JsonFusionTableOptions,
+    ) -> Result<Self> {
         let manifest = Manifest::create_or_load(base_dir.clone()).await?;
+        manifest.set_table_options(table_options.clone()).await?;
 
         let given_schema_json = serde_json::to_string(&given_schema)?;
         tokio::fs::write(base_dir.join("given_schema.json"), given_schema_json).await?;
@@ -55,6 +62,7 @@ impl JsonTableProvider {
             base_dir,
             manifest,
             given_schema,
+            table_options,
         })
     }
 
@@ -64,11 +72,13 @@ impl JsonTableProvider {
         let given_schema: ArrowSchemaRef = serde_json::from_str(&given_schema_json)?;
 
         let manifest = Manifest::create_or_load(base_dir.clone()).await?;
+        let table_options = manifest.get_table_options().await;
 
         Ok(Self {
             base_dir,
             manifest,
             given_schema,
+            table_options,
         })
     }
 }
@@ -173,12 +183,14 @@ impl TableProvider for JsonTableProvider {
         let file_path = self.base_dir.join(format!("{file_id}.parquet"));
 
         // Create ConvertWriterExec to handle JSON processing and Parquet writing
+        let writer_properties = self.table_options.parquet_writer_properties();
         let convert_writer = ConvertWriterExec::new(
             self.given_schema.clone(),
             input,
             file_path.clone(),
             None,
             true,
+            writer_properties,
         )
         .map_err(|e| {
             DataFusionError::Execution(format!("Failed to create ConvertWriterExec: {e}"))
@@ -504,15 +516,18 @@ fn is_list_type(data_type: &DataType) -> bool {
 pub struct JsonFusionSchemaProvider {
     base_dir: PathBuf,
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
-    jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>,
+    create_table_state: Arc<RwLock<JsonFusionCreateTableState>>,
 }
 
 impl JsonFusionSchemaProvider {
-    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>) -> Self {
+    pub fn new(
+        base_dir: PathBuf,
+        create_table_state: Arc<RwLock<JsonFusionCreateTableState>>,
+    ) -> Self {
         Self {
             base_dir,
             tables: RwLock::new(HashMap::new()),
-            jsonfusion_columns,
+            create_table_state,
         }
     }
 
@@ -598,12 +613,13 @@ impl SchemaProvider for JsonFusionSchemaProvider {
         name: String,
         incoming_table: Arc<dyn TableProvider>,
     ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        // Get and clear the JSONFUSION columns from shared state
-        let mut jsonfusion_column_hints = if let Ok(mut columns) = self.jsonfusion_columns.write() {
-            std::mem::take(&mut *columns)
+        // Get and clear CREATE TABLE state (JSONFUSION hints, table options, ...)
+        let mut create_table_state = if let Ok(mut state) = self.create_table_state.write() {
+            std::mem::take(&mut *state)
         } else {
-            JsonFusionColumnHints::new()
+            JsonFusionCreateTableState::default()
         };
+        let (mut jsonfusion_column_hints, table_options) = create_table_state.take();
 
         // Create a modified schema with JSONFUSION metadata
         let original_schema = incoming_table.schema();
@@ -633,7 +649,11 @@ impl SchemaProvider for JsonFusionSchemaProvider {
         let handle = tokio::runtime::Handle::current();
         let json_table = std::thread::spawn(move || {
             handle
-                .block_on(JsonTableProvider::create(table_dir, schema_with_metadata))
+                .block_on(JsonTableProvider::create(
+                    table_dir,
+                    schema_with_metadata,
+                    table_options,
+                ))
                 .unwrap()
         })
         .join()
@@ -686,17 +706,20 @@ pub struct JsonFusionCatalogProvider {
     base_dir: PathBuf,
     schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
     #[allow(dead_code)]
-    jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>,
+    create_table_state: Arc<RwLock<JsonFusionCreateTableState>>,
 }
 
 impl JsonFusionCatalogProvider {
-    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>) -> Self {
+    pub fn new(
+        base_dir: PathBuf,
+        create_table_state: Arc<RwLock<JsonFusionCreateTableState>>,
+    ) -> Self {
         let mut schemas = HashMap::new();
 
         // Auto-register the "public" schema
         let public_schema = Arc::new(JsonFusionSchemaProvider::new(
             base_dir.clone(),
-            jsonfusion_columns.clone(),
+            create_table_state.clone(),
         ));
         schemas.insert(
             "public".to_string(),
@@ -706,7 +729,7 @@ impl JsonFusionCatalogProvider {
         Self {
             base_dir,
             schemas: RwLock::new(schemas),
-            jsonfusion_columns,
+            create_table_state,
         }
     }
 
@@ -772,17 +795,20 @@ pub struct JsonFusionCatalogProviderList {
     base_dir: PathBuf,
     catalogs: RwLock<HashMap<String, Arc<dyn CatalogProvider>>>,
     #[allow(dead_code)]
-    jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>,
+    create_table_state: Arc<RwLock<JsonFusionCreateTableState>>,
 }
 
 impl JsonFusionCatalogProviderList {
-    pub fn new(base_dir: PathBuf, jsonfusion_columns: Arc<RwLock<JsonFusionColumnHints>>) -> Self {
+    pub fn new(
+        base_dir: PathBuf,
+        create_table_state: Arc<RwLock<JsonFusionCreateTableState>>,
+    ) -> Self {
         let mut catalogs = HashMap::new();
 
         // Auto-register the "jsonfusion" catalog with "public" schema
         let jsonfusion_catalog = Arc::new(JsonFusionCatalogProvider::new(
             base_dir.clone(),
-            jsonfusion_columns.clone(),
+            create_table_state.clone(),
         ));
         catalogs.insert(
             "jsonfusion".to_string(),
@@ -792,7 +818,7 @@ impl JsonFusionCatalogProviderList {
         Self {
             base_dir,
             catalogs: RwLock::new(catalogs),
-            jsonfusion_columns,
+            create_table_state,
         }
     }
 

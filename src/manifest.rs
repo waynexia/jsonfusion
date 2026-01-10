@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::convert_writer::ConvertWriterExec;
 use crate::schema::JsonFusionTableSchema;
+use crate::table_options::JsonFusionTableOptions;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileMeta {
@@ -44,6 +45,7 @@ pub struct ManifestInner {
     pub base_dir: PathBuf,
     pub file_lists: HashMap<Uuid, FileMeta>,
     pub next_manifest_id: u64,
+    pub table_options: JsonFusionTableOptions,
 }
 
 impl ManifestInner {
@@ -69,11 +71,15 @@ impl ManifestInner {
             })
             .unwrap_or(0);
 
+        let mut table_options = JsonFusionTableOptions::default();
         let mut file_lists = HashMap::new();
         for manifest_file_path in manifest_lists {
             let content = tokio::fs::read_to_string(manifest_file_path).await?;
             let manifest: ManifestEntry = serde_json::from_str(&content)?;
             match manifest {
+                ManifestEntry::SetTableOptions(options) => {
+                    table_options = options;
+                }
                 ManifestEntry::Add(file_metas) => {
                     for file_meta in file_metas {
                         file_lists.insert(file_meta.id, file_meta);
@@ -99,6 +105,7 @@ impl ManifestInner {
             base_dir: manifest_path,
             file_lists,
             next_manifest_id,
+            table_options,
         })
     }
 
@@ -190,6 +197,20 @@ impl ManifestInner {
 
         Ok(())
     }
+
+    pub async fn set_table_options(&mut self, table_options: JsonFusionTableOptions) -> Result<()> {
+        let manifest_entry = ManifestEntry::SetTableOptions(table_options.clone());
+        let manifest_file_path = self
+            .base_dir
+            .join(format!("{:010}.json", self.next_manifest_id));
+        let manifest_file_content = serde_json::to_string(&manifest_entry)?;
+        tokio::fs::write(manifest_file_path, manifest_file_content).await?;
+
+        self.next_manifest_id += 1;
+        self.table_options = table_options;
+
+        Ok(())
+    }
 }
 
 /// Thread-safe wrapper around ManifestInner
@@ -245,6 +266,17 @@ impl Manifest {
         Ok(())
     }
 
+    pub async fn get_table_options(&self) -> JsonFusionTableOptions {
+        let inner = self.inner.read().await;
+        inner.table_options.clone()
+    }
+
+    pub async fn set_table_options(&self, table_options: JsonFusionTableOptions) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.set_table_options(table_options).await?;
+        Ok(())
+    }
+
     /// Get list of file IDs in manifest
     pub async fn get_file_ids(&self) -> Vec<Uuid> {
         let inner = self.inner.read().await;
@@ -254,6 +286,7 @@ impl Manifest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ManifestEntry {
+    SetTableOptions(JsonFusionTableOptions),
     Add(Vec<FileMeta>),
     Remove(Vec<Uuid>),
     // add and remove
@@ -417,5 +450,31 @@ impl ExecutionPlan for ManifestUpdaterExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::table_options::{ParquetCompression, ParquetWriterOptions};
+
+    #[tokio::test]
+    async fn test_manifest_persists_table_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("t");
+
+        let manifest = Manifest::create_or_load(table_dir.clone()).await.unwrap();
+        let expected = JsonFusionTableOptions {
+            parquet: ParquetWriterOptions {
+                compression: ParquetCompression::Gzip { level: 9 },
+                dictionary_enabled: Some(false),
+                dictionary_page_size_limit: 123,
+            },
+        };
+        manifest.set_table_options(expected.clone()).await.unwrap();
+
+        let reloaded = Manifest::create_or_load(table_dir).await.unwrap();
+        let actual = reloaded.get_table_options().await;
+        assert_eq!(actual, expected);
     }
 }

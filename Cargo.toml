@@ -9,6 +9,7 @@ arrow = "57"
 arrow-schema = { version = "57", features = ["serde"] }
 async-trait = "0.1.89"
 bytes = "1"
+clap = { version = "4.5.32", features = ["derive"] }
 datafusion = "51"
 datafusion-common = "51"
 datafusion-expr = "51"

@@ -1,4 +1,5 @@
 mod convert_writer;
+mod create_table_state;
 mod get_field_typed;
 mod get_field_typed_type_inference;
 mod json_display;
@@ -11,13 +12,14 @@ mod logging;
 mod manifest;
 mod schema;
 mod sql_ast_rewriter;
+mod table_options;
 mod table_provider;
 mod type_planner;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use clap::Parser;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction;
@@ -33,27 +35,61 @@ use url::Url;
 
 use crate::table_provider::JsonFusionCatalogProviderList;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "jsonfusion",
+    version,
+    about = "Postgres-compatible server for JSONFusion tables"
+)]
+struct Cli {
+    /// Base directory for JSONFusion data (tables, manifests).
+    ///
+    /// Default is `./jsonfusion`.
+    #[arg(long, default_value = "./jsonfusion", value_name = "DIR")]
+    base_dir: PathBuf,
+
+    /// Host/IP address to bind the Postgres-compatible server.
+    ///
+    /// Default is `127.0.0.1`.
+    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
+    host: String,
+
+    /// Port to bind the Postgres-compatible server.
+    ///
+    /// Default is `5432`.
+    #[arg(long, default_value_t = 5432, value_name = "PORT")]
+    port: u16,
+
+    /// Enable in-memory scan cache for Parquet leaf projections.
+    ///
+    /// Default is `true`.
+    #[arg(long, default_value_t = true, value_name = "BOOL")]
+    scan_cache: bool,
+
+    /// Maximum bytes for the in-memory scan cache (0 disables caching).
+    ///
+    /// Default is `268435456` (256 MiB).
+    #[arg(long, default_value_t = 256 * 1024 * 1024, value_name = "BYTES")]
+    scan_cache_max_bytes: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     logging::init_tracing();
 
-    let json_base_dir = std::env::var("JSONFUSION_BASE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./jsonfusion"));
-    let server_host = std::env::var("JSONFUSION_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let server_port = match std::env::var("JSONFUSION_PORT") {
-        Ok(port) => port.parse::<u16>().map_err(|err| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid JSONFUSION_PORT {port:?}: {err}"),
-            )
-        })?,
-        Err(_) => 5432,
-    };
+    let Cli {
+        base_dir,
+        host,
+        port,
+        scan_cache,
+        scan_cache_max_bytes,
+    } = Cli::parse();
+    jsonfusion_parquet_leaf_projection::set_scan_cache_config(scan_cache, scan_cache_max_bytes);
 
-    // Create shared state for JSONFUSION columns and path hints
-    let jsonfusion_columns: Arc<RwLock<jsonfusion_hints::JsonFusionColumnHints>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    // Create shared state for CREATE TABLE parsing (JSONFUSION type hints, table options, ...)
+    let create_table_state: Arc<RwLock<create_table_state::JsonFusionCreateTableState>> = Arc::new(
+        RwLock::new(create_table_state::JsonFusionCreateTableState::default()),
+    );
 
     // Configure a 4k batch size
     let mut config = SessionConfig::new()
@@ -79,8 +115,8 @@ async fn main() -> Result<(), std::io::Error> {
 
     // Create the catalog system and load existing tables
     let catalog_list = Arc::new(JsonFusionCatalogProviderList::new(
-        json_base_dir,
-        jsonfusion_columns.clone(),
+        base_dir,
+        create_table_state.clone(),
     ));
     if let Err(e) = catalog_list.load_existing_tables().await {
         warn!(error = %e, "Failed to load some existing tables");
@@ -98,7 +134,7 @@ async fn main() -> Result<(), std::io::Error> {
     );
     physical_optimizer_rules.insert(
         enforce_distribution_idx + 1,
-        Arc::new(jsonfusion_physical_optimizer::JsonFusionValueCountsPushdownRule::new()),
+        Arc::new(jsonfusion_physical_optimizer::JsonFusionValueCountsPushdownRule {}),
     );
 
     let state = SessionStateBuilder::new()
@@ -129,13 +165,11 @@ async fn main() -> Result<(), std::io::Error> {
     session_context.register_udf(get_field_typed::get_field_typed_udf());
 
     // Start the Postgres compatible server with SSL/TLS
-    let server_options = ServerOptions::new()
-        .with_host(server_host)
-        .with_port(server_port);
+    let server_options = ServerOptions::new().with_host(host).with_port(port);
 
     let hooks: Vec<Arc<dyn QueryHook>> = vec![
         Arc::new(jsonfusion_hooks::JsonFusionCreateTableHook::new(
-            jsonfusion_columns.clone(),
+            create_table_state.clone(),
         )),
         Arc::new(jsonfusion_hooks::JsonFusionBulkLoadHook::new()),
     ];

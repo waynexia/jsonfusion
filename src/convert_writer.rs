@@ -27,7 +27,6 @@ use datafusion::physical_plan::{
 use datafusion_common::{Result, internal_err};
 use futures::StreamExt;
 use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::variant::{
     BuilderSpecificState, CastOptions as VariantCastOptions, ObjectBuilder, Variant,
@@ -264,6 +263,8 @@ pub struct ConvertWriterExec {
     count_schema: SchemaRef,
     /// Optional required sort order for output data.
     sort_order: Option<LexRequirement>,
+    /// Parquet writer properties for output files.
+    writer_properties: WriterProperties,
     /// Expanded schema with processed JSON columns (set during execution)
     expanded_schema: Arc<RwLock<Option<SchemaRef>>>,
     cache: PlanProperties,
@@ -283,6 +284,7 @@ impl ConvertWriterExec {
         output_path: std::path::PathBuf,
         sort_order: Option<LexRequirement>,
         expand_json: bool,
+        writer_properties: WriterProperties,
     ) -> Result<Self> {
         let input_schema = input.schema();
         let json_columns = Self::identify_json_columns_from_schema(&given_schema)?;
@@ -300,6 +302,7 @@ impl ConvertWriterExec {
             output_path,
             count_schema,
             sort_order,
+            writer_properties,
             expanded_schema: Arc::new(RwLock::new(None)),
             cache,
         })
@@ -432,6 +435,7 @@ impl ExecutionPlan for ConvertWriterExec {
             self.output_path.clone(),
             self.sort_order.clone(),
             self.expand_json,
+            self.writer_properties.clone(),
         )?))
     }
 
@@ -486,89 +490,6 @@ impl ExecutionPlan for ConvertWriterExec {
 }
 
 impl ConvertWriterExec {
-    const DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT: usize = 64 * 1024 * 1024;
-
-    fn parquet_writer_properties() -> WriterProperties {
-        if cfg!(test) {
-            return Self::default_parquet_writer_properties();
-        }
-        Self::parquet_writer_properties_from_env()
-    }
-
-    fn default_parquet_writer_properties() -> WriterProperties {
-        WriterProperties::builder()
-            .set_compression(Self::default_compression())
-            .set_dictionary_page_size_limit(Self::DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT)
-            .build()
-    }
-
-    fn parquet_writer_properties_from_env() -> WriterProperties {
-        let mut builder = WriterProperties::builder();
-        builder = builder.set_compression(Self::compression_from_env());
-        builder = builder.set_dictionary_page_size_limit(Self::DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT);
-
-        if let Some(dictionary_enabled) = std::env::var("JSONFUSION_PARQUET_DICTIONARY_ENABLED")
-            .ok()
-            .and_then(|value| parse_bool_env_var(&value))
-        {
-            builder = builder.set_dictionary_enabled(dictionary_enabled);
-        }
-
-        if let Some(dictionary_page_size_limit) =
-            std::env::var("JSONFUSION_PARQUET_DICTIONARY_PAGE_SIZE_LIMIT")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-        {
-            builder = builder.set_dictionary_page_size_limit(dictionary_page_size_limit);
-        }
-
-        builder.build()
-    }
-
-    fn default_compression() -> Compression {
-        let zstd_level = ZstdLevel::try_new(6).unwrap_or_default();
-        Compression::ZSTD(zstd_level)
-    }
-
-    fn compression_from_env() -> Compression {
-        let Ok(codec) = std::env::var("JSONFUSION_PARQUET_COMPRESSION") else {
-            return Self::default_compression();
-        };
-
-        match codec.trim().to_lowercase().as_str() {
-            "zstd" => {
-                let level = std::env::var("JSONFUSION_PARQUET_ZSTD_LEVEL")
-                    .ok()
-                    .and_then(|value| value.parse::<i32>().ok())
-                    .and_then(|level| ZstdLevel::try_new(level).ok())
-                    .unwrap_or_else(|| ZstdLevel::try_new(6).unwrap_or_default());
-                Compression::ZSTD(level)
-            }
-            "snappy" => Compression::SNAPPY,
-            "lz4_raw" => Compression::LZ4_RAW,
-            "lz4" => Compression::LZ4,
-            "gzip" => {
-                let level = std::env::var("JSONFUSION_PARQUET_GZIP_LEVEL")
-                    .ok()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .and_then(|level| GzipLevel::try_new(level).ok())
-                    .unwrap_or_default();
-                Compression::GZIP(level)
-            }
-            "brotli" => {
-                let level = std::env::var("JSONFUSION_PARQUET_BROTLI_LEVEL")
-                    .ok()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .and_then(|level| BrotliLevel::try_new(level).ok())
-                    .unwrap_or_default();
-                Compression::BROTLI(level)
-            }
-            "uncompressed" | "none" => Compression::UNCOMPRESSED,
-            _ => Self::default_compression(),
-        }
-    }
-
     /// Get the expanded schema after processing (used by ManifestUpdaterExec)
     #[allow(dead_code)]
     pub fn get_expanded_schema(&self) -> Result<SchemaRef> {
@@ -721,9 +642,12 @@ impl ConvertWriterExec {
         })?;
 
         // Create Parquet writer with the unified expanded schema
-        let props = Self::parquet_writer_properties();
-        let mut writer = ArrowWriter::try_new(file, final_schema.clone(), Some(props))
-            .map_err(datafusion_common::DataFusionError::from)?;
+        let mut writer = ArrowWriter::try_new(
+            file,
+            final_schema.clone(),
+            Some(self.writer_properties.clone()),
+        )
+        .map_err(datafusion_common::DataFusionError::from)?;
 
         // Second pass: write all processed batches
         for processed_batch in processed_batches {
@@ -1021,14 +945,6 @@ impl ConvertWriterExec {
                 }
             }
         }
-    }
-}
-
-fn parse_bool_env_var(value: &str) -> Option<bool> {
-    match value.trim().to_lowercase().as_str() {
-        "1" | "true" | "yes" | "y" | "on" => Some(true),
-        "0" | "false" | "no" | "n" | "off" => Some(false),
-        _ => None,
     }
 }
 
@@ -3227,8 +3143,16 @@ mod tests {
         let ctx = datafusion::prelude::SessionContext::new();
         let input_plan = mem_table.scan(&ctx.state(), None, &[], None).await?;
 
-        let writer_exec =
-            ConvertWriterExec::new(schema.clone(), input_plan, output_path.clone(), None, true)?;
+        let writer_properties =
+            crate::table_options::JsonFusionTableOptions::default().parquet_writer_properties();
+        let writer_exec = ConvertWriterExec::new(
+            schema.clone(),
+            input_plan,
+            output_path.clone(),
+            None,
+            true,
+            writer_properties,
+        )?;
 
         // Execute the writer
         let task_context = Arc::new(datafusion::execution::TaskContext::default());

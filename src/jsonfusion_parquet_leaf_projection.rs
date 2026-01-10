@@ -2,7 +2,7 @@ use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Formatter};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
@@ -31,14 +31,20 @@ struct ScanCacheConfig {
     max_bytes: usize,
 }
 
-static SCAN_CACHE_CONFIG: LazyLock<ScanCacheConfig> = LazyLock::new(|| ScanCacheConfig {
-    enabled: read_bool_env("JSONFUSION_SCAN_CACHE", true),
-    max_bytes: std::env::var("JSONFUSION_SCAN_CACHE_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|bytes| *bytes > 0)
-        .unwrap_or(256 * 1024 * 1024),
-});
+const DEFAULT_SCAN_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+static SCAN_CACHE_CONFIG: OnceLock<ScanCacheConfig> = OnceLock::new();
+
+pub fn set_scan_cache_config(enabled: bool, max_bytes: usize) {
+    let _ = SCAN_CACHE_CONFIG.set(ScanCacheConfig { enabled, max_bytes });
+}
+
+fn scan_cache_config() -> &'static ScanCacheConfig {
+    SCAN_CACHE_CONFIG.get_or_init(|| ScanCacheConfig {
+        enabled: true,
+        max_bytes: DEFAULT_SCAN_CACHE_MAX_BYTES,
+    })
+}
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct ScanCacheKey {
@@ -125,19 +131,7 @@ impl ScanCache {
 }
 
 static SCAN_CACHE: LazyLock<Mutex<ScanCache>> =
-    LazyLock::new(|| Mutex::new(ScanCache::new(SCAN_CACHE_CONFIG.max_bytes)));
-
-fn read_bool_env(key: &str, default: bool) -> bool {
-    let Ok(value) = std::env::var(key) else {
-        return default;
-    };
-
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "t" | "yes" | "y" | "on" => true,
-        "0" | "false" | "f" | "no" | "n" | "off" => false,
-        _ => default,
-    }
-}
+    LazyLock::new(|| Mutex::new(ScanCache::new(scan_cache_config().max_bytes)));
 
 fn schema_hash(schema: &Schema) -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -438,20 +432,20 @@ impl FileOpener for JsonFusionParquetLeafProjectionOpener {
         let file_range = partitioned_file.range.clone();
         let projected_schema = SchemaRef::from(logical_file_schema.project(&projection)?);
 
-        let scan_cache_key = if SCAN_CACHE_CONFIG.enabled && file_range.is_none() && limit.is_none()
-        {
-            Some(ScanCacheKey {
-                location: partitioned_file.object_meta.location.to_string(),
-                size: partitioned_file.object_meta.size,
-                last_modified_ms: partitioned_file
-                    .object_meta
-                    .last_modified
-                    .timestamp_millis(),
-                schema_hash: schema_hash(projected_schema.as_ref()),
-            })
-        } else {
-            None
-        };
+        let scan_cache_key =
+            if scan_cache_config().enabled && file_range.is_none() && limit.is_none() {
+                Some(ScanCacheKey {
+                    location: partitioned_file.object_meta.location.to_string(),
+                    size: partitioned_file.object_meta.size,
+                    last_modified_ms: partitioned_file
+                        .object_meta
+                        .last_modified
+                        .timestamp_millis(),
+                    schema_hash: schema_hash(projected_schema.as_ref()),
+                })
+            } else {
+                None
+            };
 
         if let Some(key) = scan_cache_key.as_ref()
             && let Some(batches) = SCAN_CACHE

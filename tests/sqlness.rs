@@ -77,7 +77,8 @@ impl EnvController for JsonFusionEnv {
 
         let mut child = Command::new(env!("CARGO_BIN_EXE_jsonfusion"))
             .current_dir(temp_dir.path())
-            .env("JSONFUSION_PORT", port.to_string())
+            .arg("--port")
+            .arg(port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
