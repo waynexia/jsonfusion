@@ -1,8 +1,10 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Formatter};
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::datasource::listing::{FileRange, PartitionedFile};
 use datafusion::datasource::physical_plan::parquet::DefaultParquetFileReaderFactory;
@@ -16,12 +18,217 @@ use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_common::{DataFusionError, Result, Statistics};
 use futures::TryStreamExt;
-use futures::stream::StreamExt;
+use futures::stream::{BoxStream, StreamExt};
 use object_store::ObjectStore;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::schema::types::SchemaDescriptor;
+
+#[derive(Debug, Clone)]
+struct ScanCacheConfig {
+    enabled: bool,
+    max_bytes: usize,
+}
+
+static SCAN_CACHE_CONFIG: LazyLock<ScanCacheConfig> = LazyLock::new(|| ScanCacheConfig {
+    enabled: read_bool_env("JSONFUSION_SCAN_CACHE", true),
+    max_bytes: std::env::var("JSONFUSION_SCAN_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(256 * 1024 * 1024),
+});
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ScanCacheKey {
+    location: String,
+    size: u64,
+    last_modified_ms: i64,
+    schema_hash: u64,
+}
+
+#[derive(Debug)]
+struct ScanCacheEntry {
+    batches: Arc<Vec<RecordBatch>>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct ScanCache {
+    max_bytes: usize,
+    current_bytes: usize,
+    entries: HashMap<ScanCacheKey, ScanCacheEntry>,
+    order: VecDeque<ScanCacheKey>,
+}
+
+impl ScanCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            current_bytes: 0,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &ScanCacheKey) -> Option<Arc<Vec<RecordBatch>>> {
+        let batches = self
+            .entries
+            .get(key)
+            .map(|entry| Arc::clone(&entry.batches))?;
+        self.touch(key);
+        Some(batches)
+    }
+
+    fn insert(&mut self, key: ScanCacheKey, batches: Vec<RecordBatch>) {
+        if self.max_bytes == 0 {
+            return;
+        }
+
+        let bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        if bytes > self.max_bytes {
+            return;
+        }
+
+        if let Some(existing) = self.entries.remove(&key) {
+            self.current_bytes = self.current_bytes.saturating_sub(existing.bytes);
+            self.order.retain(|k| k != &key);
+        }
+
+        while self.current_bytes + bytes > self.max_bytes {
+            let Some(evict_key) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&evict_key) {
+                self.current_bytes = self.current_bytes.saturating_sub(evicted.bytes);
+            }
+        }
+
+        self.current_bytes += bytes;
+        self.order.push_back(key.clone());
+        self.entries.insert(
+            key,
+            ScanCacheEntry {
+                batches: Arc::new(batches),
+                bytes,
+            },
+        );
+    }
+
+    fn touch(&mut self, key: &ScanCacheKey) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key.clone());
+        }
+    }
+}
+
+static SCAN_CACHE: LazyLock<Mutex<ScanCache>> =
+    LazyLock::new(|| Mutex::new(ScanCache::new(SCAN_CACHE_CONFIG.max_bytes)));
+
+fn read_bool_env(key: &str, default: bool) -> bool {
+    let Ok(value) = std::env::var(key) else {
+        return default;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "t" | "yes" | "y" | "on" => true,
+        "0" | "false" | "f" | "no" | "n" | "off" => false,
+        _ => default,
+    }
+}
+
+fn schema_hash(schema: &Schema) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+
+    let mut hasher = DefaultHasher::new();
+    schema.fields().len().hash(&mut hasher);
+    for field in schema.fields().iter() {
+        hash_field(field.as_ref(), &mut hasher);
+    }
+    let mut schema_metadata = schema.metadata().iter().collect::<Vec<_>>();
+    schema_metadata.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+    for (key, value) in schema_metadata {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn hash_field(field: &arrow_schema::Field, hasher: &mut impl Hasher) {
+    field.name().hash(hasher);
+    field.data_type().hash(hasher);
+    field.is_nullable().hash(hasher);
+    let mut metadata = field.metadata().iter().collect::<Vec<_>>();
+    metadata.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+    for (key, value) in metadata {
+        key.hash(hasher);
+        value.hash(hasher);
+    }
+}
+
+struct ScanCacheStream {
+    inner: BoxStream<'static, Result<RecordBatch>>,
+    key: ScanCacheKey,
+    cached: bool,
+    finished: bool,
+    batches: Vec<RecordBatch>,
+}
+
+impl ScanCacheStream {
+    fn new(inner: BoxStream<'static, Result<RecordBatch>>, key: ScanCacheKey) -> Self {
+        Self {
+            inner,
+            key,
+            cached: false,
+            finished: false,
+            batches: Vec::new(),
+        }
+    }
+
+    fn cache(&mut self) {
+        if self.cached {
+            return;
+        }
+        self.cached = true;
+
+        let mut cache = SCAN_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(self.key.clone(), std::mem::take(&mut self.batches));
+    }
+}
+
+impl futures::Stream for ScanCacheStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.finished {
+            return std::task::Poll::Ready(None);
+        }
+
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(batch))) => {
+                self.batches.push(batch.clone());
+                std::task::Poll::Ready(Some(Ok(batch)))
+            }
+            std::task::Poll::Ready(Some(Err(err))) => {
+                self.finished = true;
+                std::task::Poll::Ready(Some(Err(err)))
+            }
+            std::task::Poll::Ready(None) => {
+                self.finished = true;
+                self.cache();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct JsonFusionParquetLeafProjectionSource {
@@ -229,8 +436,32 @@ impl FileOpener for JsonFusionParquetLeafProjectionOpener {
         let parquet_file_reader_factory = Arc::clone(&self.parquet_file_reader_factory);
         let metrics = self.metrics.clone();
         let file_range = partitioned_file.range.clone();
-
         let projected_schema = SchemaRef::from(logical_file_schema.project(&projection)?);
+
+        let scan_cache_key = if SCAN_CACHE_CONFIG.enabled && file_range.is_none() && limit.is_none()
+        {
+            Some(ScanCacheKey {
+                location: partitioned_file.object_meta.location.to_string(),
+                size: partitioned_file.object_meta.size,
+                last_modified_ms: partitioned_file
+                    .object_meta
+                    .last_modified
+                    .timestamp_millis(),
+                schema_hash: schema_hash(projected_schema.as_ref()),
+            })
+        } else {
+            None
+        };
+
+        if let Some(key) = scan_cache_key.as_ref()
+            && let Some(batches) = SCAN_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(key)
+        {
+            let stream = futures::stream::iter((*batches).clone().into_iter().map(Ok)).boxed();
+            return Ok(Box::pin(async move { Ok(stream) }));
+        }
         let schema_adapter = schema_adapter_factory.create(
             Arc::clone(&projected_schema),
             Arc::clone(&logical_file_schema),
@@ -280,7 +511,13 @@ impl FileOpener for JsonFusionParquetLeafProjectionOpener {
                 .map_err(DataFusionError::from)
                 .map(move |b| b.and_then(|b| schema_mapping.map_batch(b)));
 
-            Ok(stream.boxed())
+            let stream = stream.boxed();
+            let stream: BoxStream<'static, Result<RecordBatch>> = match scan_cache_key {
+                Some(key) => ScanCacheStream::new(stream, key).boxed(),
+                None => stream,
+            };
+
+            Ok(stream)
         }))
     }
 }

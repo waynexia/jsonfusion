@@ -2,8 +2,8 @@ use std::any::Any;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
-    StructArray, new_null_array,
+    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, StringBuilder,
+    StringViewArray, StructArray, new_null_array,
 };
 use arrow::compute::CastOptions;
 use arrow::datatypes::{DataType, Field, FieldRef};
@@ -120,6 +120,137 @@ impl ScalarUDFImpl for GetFieldTypedUdfImpl {
                     return Ok(ColumnarValue::Array(values));
                 }
                 if json_default && let Some(resolved) = resolve_struct_path(array, &segments) {
+                    match resolved.leaf.data_type() {
+                        DataType::Utf8 => {
+                            let Some(values) = resolved.leaf.as_any().downcast_ref::<StringArray>()
+                            else {
+                                return internal_err!("get_field_typed expected Utf8 array");
+                            };
+
+                            let values_len = values.value_data().len();
+                            let quote_bytes =
+                                (values.len().saturating_sub(values.null_count())) * 2;
+                            let mut builder =
+                                StringBuilder::with_capacity(array.len(), values_len + quote_bytes);
+                            let mut scratch = String::new();
+
+                            for index in 0..array.len() {
+                                if struct_path_is_null(&resolved.parents, index)
+                                    || values.is_null(index)
+                                {
+                                    builder.append_null();
+                                    continue;
+                                }
+
+                                let value = values.value(index);
+                                if value
+                                    .bytes()
+                                    .any(|byte| matches!(byte, b'"' | b'\\' | 0x00..=0x1f))
+                                {
+                                    let json = serde_json::to_string(value).map_err(|e| {
+                                        datafusion_common::DataFusionError::Execution(format!(
+                                            "Failed to serialize JSON string: {e}"
+                                        ))
+                                    })?;
+                                    builder.append_value(&json);
+                                } else {
+                                    scratch.clear();
+                                    scratch.push('"');
+                                    scratch.push_str(value);
+                                    scratch.push('"');
+                                    builder.append_value(&scratch);
+                                }
+                            }
+
+                            return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+                        }
+                        DataType::LargeUtf8 => {
+                            let Some(values) =
+                                resolved.leaf.as_any().downcast_ref::<LargeStringArray>()
+                            else {
+                                return internal_err!("get_field_typed expected LargeUtf8 array");
+                            };
+
+                            let values_len = values.value_data().len();
+                            let quote_bytes =
+                                (values.len().saturating_sub(values.null_count())) * 2;
+                            let mut builder =
+                                StringBuilder::with_capacity(array.len(), values_len + quote_bytes);
+                            let mut scratch = String::new();
+
+                            for index in 0..array.len() {
+                                if struct_path_is_null(&resolved.parents, index)
+                                    || values.is_null(index)
+                                {
+                                    builder.append_null();
+                                    continue;
+                                }
+
+                                let value = values.value(index);
+                                if value
+                                    .bytes()
+                                    .any(|byte| matches!(byte, b'"' | b'\\' | 0x00..=0x1f))
+                                {
+                                    let json = serde_json::to_string(value).map_err(|e| {
+                                        datafusion_common::DataFusionError::Execution(format!(
+                                            "Failed to serialize JSON string: {e}"
+                                        ))
+                                    })?;
+                                    builder.append_value(&json);
+                                } else {
+                                    scratch.clear();
+                                    scratch.push('"');
+                                    scratch.push_str(value);
+                                    scratch.push('"');
+                                    builder.append_value(&scratch);
+                                }
+                            }
+
+                            return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+                        }
+                        DataType::Utf8View => {
+                            let Some(values) =
+                                resolved.leaf.as_any().downcast_ref::<StringViewArray>()
+                            else {
+                                return internal_err!("get_field_typed expected Utf8View array");
+                            };
+
+                            let mut builder = StringBuilder::with_capacity(array.len(), 0);
+                            let mut scratch = String::new();
+
+                            for index in 0..array.len() {
+                                if struct_path_is_null(&resolved.parents, index)
+                                    || values.is_null(index)
+                                {
+                                    builder.append_null();
+                                    continue;
+                                }
+
+                                let value = values.value(index);
+                                if value
+                                    .bytes()
+                                    .any(|byte| matches!(byte, b'"' | b'\\' | 0x00..=0x1f))
+                                {
+                                    let json = serde_json::to_string(value).map_err(|e| {
+                                        datafusion_common::DataFusionError::Execution(format!(
+                                            "Failed to serialize JSON string: {e}"
+                                        ))
+                                    })?;
+                                    builder.append_value(&json);
+                                } else {
+                                    scratch.clear();
+                                    scratch.push('"');
+                                    scratch.push_str(value);
+                                    scratch.push('"');
+                                    builder.append_value(&scratch);
+                                }
+                            }
+
+                            return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+                        }
+                        _ => {}
+                    }
+
                     let mut values = Vec::with_capacity(array.len());
                     for index in 0..array.len() {
                         if struct_path_is_null(&resolved.parents, index) {
