@@ -20,6 +20,7 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion_common::ScalarValue;
 
 use crate::jsonfusion_parquet_leaf_projection::JsonFusionParquetLeafProjectionSource;
+use crate::jsonfusion_value_counts_exec::JsonFusionValueCountsExec;
 
 #[derive(Debug, Default)]
 pub struct JsonFusionPruneParquetSchemaRule;
@@ -90,11 +91,233 @@ impl PhysicalOptimizerRule for JsonFusionPruneParquetSchemaRule {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct JsonFusionValueCountsPushdownRule;
+
+impl JsonFusionValueCountsPushdownRule {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl PhysicalOptimizerRule for JsonFusionValueCountsPushdownRule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let debug = debug_enabled();
+
+        if !read_bool_env("JSONFUSION_VALUE_COUNTS_PUSHDOWN", true) {
+            return Ok(plan);
+        }
+
+        let mut data_source_execs = Vec::new();
+        collect_data_source_execs(&plan, &mut data_source_execs);
+        if data_source_execs.len() != 1 {
+            if debug {
+                eprintln!(
+                    "jsonfusion_value_counts_pushdown: skip (expected 1 DataSourceExec, got {})",
+                    data_source_execs.len()
+                );
+            }
+            return Ok(plan);
+        }
+
+        if contains_filter_exec(&plan) {
+            if debug {
+                eprintln!("jsonfusion_value_counts_pushdown: skip (FilterExec present)");
+            }
+            return Ok(plan);
+        }
+
+        let Some((root_column, path)) = find_count_star_group_by_get_field_typed(&plan)? else {
+            if debug {
+                eprintln!("jsonfusion_value_counts_pushdown: skip (no matching aggregate)");
+            }
+            return Ok(plan);
+        };
+
+        let scan = data_source_execs[0]
+            .as_any()
+            .downcast_ref::<DataSourceExec>()
+            .expect("DataSourceExec verified")
+            .data_source();
+        let Some(file_scan) = scan.as_any().downcast_ref::<FileScanConfig>() else {
+            if debug {
+                eprintln!(
+                    "jsonfusion_value_counts_pushdown: skip (data source is not FileScanConfig)"
+                );
+            }
+            return Ok(plan);
+        };
+
+        if file_scan.file_source.file_type() != "parquet" {
+            if debug {
+                eprintln!(
+                    "jsonfusion_value_counts_pushdown: skip (file_type={})",
+                    file_scan.file_source.file_type()
+                );
+            }
+            return Ok(plan);
+        }
+
+        if file_scan.file_source.filter().is_some() {
+            if debug {
+                eprintln!("jsonfusion_value_counts_pushdown: skip (scan has filter)");
+            }
+            return Ok(plan);
+        }
+
+        let files = file_scan
+            .file_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        if files.is_empty() {
+            return Ok(plan);
+        }
+
+        if files.iter().any(|file| file.range.is_some()) {
+            if debug {
+                eprintln!("jsonfusion_value_counts_pushdown: skip (file ranges present)");
+            }
+            return Ok(plan);
+        }
+
+        let exec = JsonFusionValueCountsExec::try_new(
+            plan.schema(),
+            file_scan.object_store_url.clone(),
+            files,
+            root_column,
+            path,
+        )?;
+
+        if debug {
+            eprintln!("jsonfusion_value_counts_pushdown: applied");
+        }
+
+        Ok(Arc::new(exec))
+    }
+
+    fn name(&self) -> &str {
+        "jsonfusion_value_counts_pushdown"
+    }
+
+    fn schema_check(&self) -> bool {
+        false
+    }
+}
+
 fn debug_enabled() -> bool {
     match std::env::var("JSONFUSION_DEBUG_PRUNE_PARQUET_SCHEMA") {
         Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
         Err(_) => false,
     }
+}
+
+fn read_bool_env(key: &str, default: bool) -> bool {
+    let Ok(value) = std::env::var(key) else {
+        return default;
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "t" | "yes" | "y" | "on" => true,
+        "0" | "false" | "f" | "no" | "n" | "off" => false,
+        _ => default,
+    }
+}
+
+fn contains_filter_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.as_any().is::<FilterExec>() {
+        return true;
+    }
+    for child in plan.children() {
+        if contains_filter_exec(child) {
+            return true;
+        }
+    }
+    false
+}
+
+fn find_count_star_group_by_get_field_typed(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<(String, String)>> {
+    if let Some(aggregate) = plan.as_any().downcast_ref::<AggregateExec>()
+        && let Some((root_column, path)) = extract_count_star_group_by_get_field_typed(aggregate)?
+    {
+        return Ok(Some((root_column, path)));
+    }
+
+    for child in plan.children() {
+        if let Some(found) = find_count_star_group_by_get_field_typed(child)? {
+            return Ok(Some(found));
+        }
+    }
+
+    Ok(None)
+}
+
+fn extract_count_star_group_by_get_field_typed(
+    aggregate: &AggregateExec,
+) -> Result<Option<(String, String)>> {
+    if aggregate.group_expr().expr().len() != 1 || !aggregate.group_expr().null_expr().is_empty() {
+        return Ok(None);
+    }
+
+    if aggregate.aggr_expr().len() != 1 || aggregate.filter_expr().iter().any(|expr| expr.is_some())
+    {
+        return Ok(None);
+    }
+
+    let count_expr = &aggregate.aggr_expr()[0];
+    if count_expr.fun().name() != "count" {
+        return Ok(None);
+    }
+
+    let aggr_args = count_expr.expressions();
+    if aggr_args.len() != 1 || !is_literal_one(&aggr_args[0]) {
+        return Ok(None);
+    }
+
+    let group_expr = &aggregate.group_expr().expr()[0].0;
+    let Some(fun) = group_expr.as_any().downcast_ref::<ScalarFunctionExpr>() else {
+        return Ok(None);
+    };
+    if fun.name() != "get_field_typed" || fun.args().len() != 2 {
+        return Ok(None);
+    }
+
+    let Some(root_column) = extract_column_name(fun.args().first()) else {
+        return Ok(None);
+    };
+    let Some(path) = extract_literal_string(fun.args().get(1)) else {
+        return Ok(None);
+    };
+
+    if path.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some((root_column, path)))
+}
+
+fn is_literal_one(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let Some(literal) = expr.as_any().downcast_ref::<Literal>() else {
+        return false;
+    };
+    matches!(
+        literal.value(),
+        ScalarValue::Int8(Some(1))
+            | ScalarValue::Int16(Some(1))
+            | ScalarValue::Int32(Some(1))
+            | ScalarValue::Int64(Some(1))
+            | ScalarValue::UInt8(Some(1))
+            | ScalarValue::UInt16(Some(1))
+            | ScalarValue::UInt32(Some(1))
+            | ScalarValue::UInt64(Some(1))
+    )
 }
 
 #[derive(Debug, Default)]

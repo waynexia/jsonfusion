@@ -2099,6 +2099,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",

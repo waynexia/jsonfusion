@@ -6,6 +6,7 @@ mod jsonfusion_hints;
 mod jsonfusion_hooks;
 mod jsonfusion_parquet_leaf_projection;
 mod jsonfusion_physical_optimizer;
+mod jsonfusion_value_counts_exec;
 mod manifest;
 mod schema;
 mod sql_ast_rewriter;
@@ -90,6 +91,10 @@ async fn main() -> Result<(), std::io::Error> {
     physical_optimizer_rules.insert(
         enforce_distribution_idx,
         Arc::new(jsonfusion_physical_optimizer::JsonFusionPruneParquetSchemaRule::new()),
+    );
+    physical_optimizer_rules.insert(
+        enforce_distribution_idx + 1,
+        Arc::new(jsonfusion_physical_optimizer::JsonFusionValueCountsPushdownRule::new()),
     );
 
     let state = SessionStateBuilder::new()
